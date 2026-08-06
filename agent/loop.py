@@ -23,12 +23,23 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from .context import ContextManager, estimate_tokens
+from .context import ContextManager
 from .llm import LLMClient, LLMError, ToolCall
-from .prompts import SYSTEM_PROMPT, budget_warning, nudge_no_tool, nudge_stuck
+from .prompts import (
+    SYSTEM_PROMPT,
+    budget_warning,
+    nudge_barren,
+    nudge_no_tool,
+    nudge_stuck,
+)
 from .sandbox import Sandbox
 from .tools import TOOL_SCHEMAS, ToolBox
 from .trace import TraceRecorder
+
+
+# 连续多少个「工具调用全军覆没」的回合后判定失败。
+# 按回合而非按调用计数，理由见 run() 中 ③ 处注释。
+MAX_DEAD_TURNS = 3
 
 
 class Outcome(StrEnum):
@@ -56,18 +67,30 @@ class RunResult:
 class _ProgressGuard:
     """检测原地打转。
 
-    模型卡住的典型表现是反复以相同参数调用同一个工具。
-    不管的话，步数会被白白烧光却毫无进展。
+    两种打转形态，必须分别检测 —— 这是实战踩出来的教训：
+
+    **形态 A：参数完全相同的重复调用。** 最容易想到，也最容易检测。
+
+    **形态 B：参数每次都不同，但一直没有产出。** 更隐蔽也更常见。
+    实际观察到的案例：模型为了确认一个日志文件的日期范围，
+    连续用不同正则去搜（``^2025-12-2[5-9]``、``^2025-12-1[6-9]`` …），
+    每次命中 0 条。因为参数不同，形态 A 的检测**完全不会触发**，
+    结果 6 万多 token 烧在一个根本不必要的探测上。
+
+    因此除了签名重复，还要追踪「这一步有没有带来新信息」。
     """
 
-    def __init__(self, repeat_limit: int = 3) -> None:
+    def __init__(self, repeat_limit: int = 3, barren_limit: int = 4) -> None:
         self.repeat_limit = repeat_limit
+        self.barren_limit = barren_limit
         self._last_signature: str | None = None
         self._repeats = 0
+        self._barren = 0
+        self._seen_reads: set[str] = set()
         self._no_tool_strikes = 0
 
-    def observe(self, calls: list[ToolCall]) -> bool:
-        """返回 True 表示"疑似卡住"。"""
+    def observe_calls(self, calls: list[ToolCall]) -> bool:
+        """形态 A：签名重复。返回 True 表示疑似卡住。"""
         signature = "|".join(f"{c.name}:{sorted(c.args.items())!r}" for c in calls)
         if signature == self._last_signature:
             self._repeats += 1
@@ -75,6 +98,40 @@ class _ProgressGuard:
             self._last_signature = signature
             self._repeats = 1
         return self._repeats >= self.repeat_limit
+
+    def observe_result(self, call: ToolCall, result: Any) -> None:
+        """形态 B：累计"这一步有没有带来新信息"。
+
+        判定为**有产出**的情形：
+        * 成功的写/移动（改变了世界状态）
+        * search 命中数 > 0
+        * 首次读取某个文件
+        * list_dir（结构信息总是有用的）
+
+        其余（失败、0 命中的搜索、重复读同一文件）计为"空转"。
+        """
+        productive = False
+        if result.ok:
+            data = result.data
+            if call.name in ("write_file", "move_file"):
+                productive = True
+            elif call.name == "search":
+                productive = data.get("total_hits", 0) > 0
+            elif call.name == "read_file":
+                key = f"{data.get('path')}:{data.get('offset')}"
+                productive = key not in self._seen_reads
+                self._seen_reads.add(key)
+            elif call.name == "list_dir":
+                productive = True
+
+        self._barren = 0 if productive else self._barren + 1
+
+    def is_barren(self) -> bool:
+        return self._barren >= self.barren_limit
+
+    def reset_barren(self) -> None:
+        """注入过纠偏提示后清零，给模型一次改正的机会再判定。"""
+        self._barren = 0
 
     def no_tool(self) -> int:
         self._no_tool_strikes += 1
@@ -116,6 +173,7 @@ class AgentRunner:
         ]
         guard = _ProgressGuard()
         warned = False
+        dead_turns = 0
 
         for step in range(1, self.max_steps + 1):
             self.trace.step_start(step)
@@ -148,6 +206,14 @@ class AgentRunner:
                 continue
 
             # ---- ③ 执行工具 ------------------------------------------
+            # 统计本回合的成败。**必须按回合计，不能按单次调用计** ——
+            # 模型可以在一个回合里并行发出十几个调用，而它只在回合结束后
+            # 才看到全部结果。若按调用数判死，一次批量幻觉文件名就会被算成
+            # "连续 N 次失败"直接终止，模型连一次纠正机会都没有。
+            # （实测踩过：一个回合 8 次成功 + 5 次幻觉路径，被误判为致命失败。）
+            turn_ok = 0
+            turn_failed = 0
+
             for call in reply.tool_calls:
                 if call.name == "finish":
                     summary = str(call.args.get("summary") or "任务完成。")
@@ -157,6 +223,11 @@ class AgentRunner:
                     )
 
                 result = self.tools.execute(call.name, call.args)
+                guard.observe_result(call, result)
+                if result.ok:
+                    turn_ok += 1
+                else:
+                    turn_failed += 1
 
                 # 记录真实写操作，作为 DEGRADED 时的产物凭据
                 if result.ok:
@@ -176,34 +247,65 @@ class AgentRunner:
                 )
 
             # ---- ⑤ 判定：继续还是终止 ---------------------------------
-            if self.tools.consecutive_errors >= 5:
-                return self._finish(
-                    Outcome.FAILED,
-                    "连续 5 次工具调用失败，终止以避免空转。",
-                    step,
+            # 只有**整个回合一无所获**才算一次失败回合。
+            # 部分成功（哪怕只有一个）说明模型仍在推进，应当继续。
+            if turn_ok == 0 and turn_failed > 0:
+                dead_turns += 1
+                if dead_turns >= MAX_DEAD_TURNS:
+                    return self._finish(
+                        Outcome.FAILED,
+                        f"连续 {MAX_DEAD_TURNS} 个回合的工具调用全部失败，终止以避免空转。",
+                        step,
+                    )
+                self.trace.note(
+                    step, f"本回合 {turn_failed} 次调用全部失败（{dead_turns}/{MAX_DEAD_TURNS}）"
                 )
+            else:
+                dead_turns = 0
 
-            used = estimate_tokens(self.messages) + self.llm.usage.total_tokens
-            if used >= self.token_budget:
+            # 预算判定用**实际消耗的 API token**。
+            #
+            # 早先这里写的是 estimate_tokens(messages) + usage.total_tokens，
+            # 那是重复计数：usage.total_tokens 已经把每一轮重发的历史都算进去了，
+            # 再加一次当前历史的估算，会让预算提前约 20% 触顶。
+            # 实测中一次任务实际只花了 64.6k，却被判成 80k 而提前终止。
+            spent = self.llm.usage.total_tokens
+            if spent >= self.token_budget:
                 return self._finish(
                     Outcome.DEGRADED,
                     f"token 预算（{self.token_budget}）耗尽，已交付此前完成的产物。",
                     step,
                 )
 
-            if guard.observe(reply.tool_calls):
+            # 打转检测：两种形态分别处理
+            if guard.observe_calls(reply.tool_calls):
                 self.trace.note(step, "检测到重复动作，注入纠偏提示")
                 self.messages.append(
                     {"role": "user", "content": nudge_stuck(reply.tool_calls[0].name)}
                 )
+            elif guard.is_barren():
+                # 参数每次都变、但一直没有新信息 —— 比重复调用更隐蔽也更烧钱
+                self.trace.note(step, "连续多步无新信息，提示改变策略")
+                self.messages.append({"role": "user", "content": nudge_barren()})
+                guard.reset_barren()
 
             # 提前预警，让模型有机会先落盘再被截断 ——
             # 这一条直接决定 DEGRADED 时还剩下什么可交付。
-            remaining = self.max_steps - step
-            if remaining <= 3 and not warned:
+            #
+            # 必须同时看步数与 token 两种压力：早先只看步数，
+            # 结果任务在第 10/40 步就撞上 token 预算，预警根本没机会触发，
+            # DEGRADED 来得毫无征兆。
+            pressure = max(step / self.max_steps, spent / max(self.token_budget, 1))
+            if pressure >= 0.75 and not warned:
                 warned = True
-                self.trace.note(step, f"接近步数上限，提示模型收尾（剩余 {remaining} 步）")
-                self.messages.append({"role": "user", "content": budget_warning(remaining)})
+                left_steps = self.max_steps - step
+                left_tokens = max(self.token_budget - spent, 0)
+                self.trace.note(
+                    step, f"接近预算上限，提示模型收尾（剩 {left_steps} 步 / {left_tokens} tokens）"
+                )
+                self.messages.append(
+                    {"role": "user", "content": budget_warning(left_steps, left_tokens)}
+                )
 
         # ---- 步数打满 ------------------------------------------------
         return self._finish(

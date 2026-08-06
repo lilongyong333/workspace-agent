@@ -167,3 +167,51 @@ def test_iter_lines_streams_without_size_limit(tmp_path: Path) -> None:
     sb = Sandbox(root, max_read_bytes=1000)
     hits = [n for n, line in sb.iter_lines("big.log") if "line 4999" in line]
     assert hits == [5000]
+
+
+# ----------------------------------------------------------------------
+# 只读模式 —— 把 agent 指向用户真实资料目录时的核心保证
+# ----------------------------------------------------------------------
+def test_read_only_blocks_write_and_move(tmp_path: Path) -> None:
+    """只读沙箱必须拒绝一切写入与移动，读取照常。
+
+    这条边界的由来是一个真实事故：早期 ``ask`` 把索引根直接当工作目录，
+    agent 于是把自己生成的答案写进了被索引的语料里，
+    下一次检索时那份自产文件排到命中第一名 —— 自我引用回路。
+    换成用户的公司文档，就是 AI 静默改了正式文件。
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "contract.md").write_text("原始合同内容\n", encoding="utf-8")
+
+    sb = Sandbox(root, read_only=True)
+
+    assert "原始合同内容" in "".join(sb.read_lines("contract.md")), "只读不影响读"
+    assert sb.list_dir(".")
+
+    with pytest.raises(SandboxError, match="只读"):
+        sb.write_text("answer.md", "AI 生成的答案")
+    with pytest.raises(SandboxError, match="只读"):
+        sb.move("contract.md", "archive/contract.md")
+
+    # 语料必须原封不动
+    assert {p.name for p in root.iterdir()} == {"contract.md"}
+    assert (root / "contract.md").read_text(encoding="utf-8") == "原始合同内容\n"
+
+
+def test_read_only_mode_hides_write_tools_from_model() -> None:
+    """更强的一层：只读时写工具**根本不出现在工具清单里**。
+
+    与「没有删除工具」同源 —— 模型无法调用它看不见的工具。
+    留着工具再在运行时拒绝，等于把攻击面从「会不会被说服」
+    换成「拒绝逻辑有没有漏判」，边界强度反而下降。
+    """
+    from agent.tools import build_tool_schemas
+
+    rw = {s["function"]["name"] for s in build_tool_schemas(has_index=True)}
+    ro = {s["function"]["name"] for s in build_tool_schemas(has_index=True, read_only=True)}
+
+    assert {"write_file", "move_file"} <= rw
+    assert not ({"write_file", "move_file"} & ro), "只读模式不得暴露任何写工具"
+    # 检索能力必须完整保留，否则只读模式就没用了
+    assert {"search", "read_file", "list_dir", "describe_corpus", "get_chunk"} <= ro

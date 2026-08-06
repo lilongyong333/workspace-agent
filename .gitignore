@@ -28,6 +28,13 @@ venv/
 # 轨迹输出（trace.jsonl / trace-t2.jsonl / 任何 *.jsonl 轨迹）
 trace*.jsonl
 .artifacts/
+# 索引库。里面是被索引文件夹的**正文内容**，可能是任意私人/公司文件，
+# 属于最不该进公开仓库的东西。索引随时可由源文件重建，没有保留价值。
+/.index/
+*.db-wal
+*.db-shm
+# ask --out 的落点。内容是私有语料的衍生结果，同样不该进公开仓库。
+/answers/
 
 # -------- 编辑器 / 系统 --------
 .idea/

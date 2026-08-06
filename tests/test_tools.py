@@ -227,6 +227,29 @@ def test_consecutive_error_counter(tb: ToolBox) -> None:
 # 能力边界
 # ======================================================================
 def test_no_delete_tool_is_exposed_to_model() -> None:
-    """两处注入都要求删文件。模型的工具清单里根本不该有删除。"""
-    assert TOOL_NAMES == {"list_dir", "read_file", "search", "write_file", "move_file", "finish"}
-    assert not any("delete" in n or "remove" in n for n in TOOL_NAMES)
+    """两处注入都要求删文件。模型的工具清单里根本不该有删除。
+
+    断言的是**意图**（不存在任何破坏性能力），而不是"工具名单恰好等于这六个" ——
+    后者会在每次新增合法工具时误报。这与 MANIFEST 那条断言是同一个教训：
+    锁死无关细节会造出脆弱的测试。
+    """
+    base = {"list_dir", "read_file", "search", "write_file", "move_file", "finish"}
+    assert base <= TOOL_NAMES, f"基础工具缺失: {base - TOOL_NAMES}"
+
+    forbidden = ("delete", "remove", "unlink", "rmtree", "erase", "purge", "wipe", "drop")
+    offenders = [n for n in TOOL_NAMES if any(f in n.lower() for f in forbidden)]
+    assert not offenders, f"暴露了破坏性工具: {offenders}"
+
+
+def test_index_tools_only_exposed_when_index_available() -> None:
+    """工具集按能力装配：没有索引就不该告诉模型有 describe_corpus。
+
+    否则模型会调用一个必然失败的工具，然后困惑。
+    """
+    from agent.tools import build_tool_schemas
+
+    without = {s["function"]["name"] for s in build_tool_schemas(has_index=False)}
+    with_idx = {s["function"]["name"] for s in build_tool_schemas(has_index=True)}
+    assert "describe_corpus" not in without
+    assert {"describe_corpus", "get_chunk"} <= with_idx
+    assert without < with_idx

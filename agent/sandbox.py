@@ -52,14 +52,40 @@ class Sandbox:
     max_read_bytes:
         单次读取的字节上限。防止一次调用就把上下文撑爆——
         这是**接口层**的保护，不依赖模型自觉。
+    read_only:
+        只读模式。用于「把 agent 指向用户真实文档目录做检索」这一场景：
+        用户注册的是自己的公司资料、合同、财务表格，
+        **他要的是搜索，不是让 AI 改他的文件**。
+
+        为什么必须有这个开关：早期 ``ask`` 直接把索引根当工作目录，
+        于是 agent 把自己生成的答案写进了被索引的语料里，
+        下一次检索时那份自产文件成了命中第一名 —— 自我引用回路。
+        对企业语料，后果不止是脏数据，而是 AI 静默修改了正式文档。
+
+        与「没有删除工具」同源：真正的边界靠**能力不存在**，
+        不靠模型自觉。只读时上层会直接不向模型暴露 write_file / move_file，
+        本类的 write_text / move 再做一次兜底断言（纵深防御）。
     """
 
-    def __init__(self, root: str | Path, max_read_bytes: int = 8 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        max_read_bytes: int = 8 * 1024 * 1024,
+        read_only: bool = False,
+    ) -> None:
         resolved = Path(root).expanduser().resolve()
         if not resolved.is_dir():
             raise SandboxError(f"工作目录不存在或不是目录: {resolved}")
         self.root = resolved
         self.max_read_bytes = max_read_bytes
+        self.read_only = read_only
+
+    def _assert_writable(self, rel_path: str) -> None:
+        if self.read_only:
+            raise SandboxError(
+                f"只读模式，拒绝写入 {rel_path!r}。"
+                "当前工作根是用户注册的索引目录，本模式只允许检索与阅读。"
+            )
 
     # ------------------------------------------------------------------
     # 路径解析 —— 所有文件访问的唯一入口
@@ -179,6 +205,7 @@ class Sandbox:
     # 写 —— 受白名单约束
     # ------------------------------------------------------------------
     def write_text(self, rel_path: str, content: str) -> str:
+        self._assert_writable(rel_path)
         target = self.resolve(rel_path)
         if target.is_dir():
             raise SandboxError(f"目标是目录，无法写入: {rel_path}")
@@ -192,6 +219,7 @@ class Sandbox:
         **刻意不允许覆盖**：目标已存在则拒绝。移动是破坏性的，
         静默覆盖等于变相删除，而删除正是本沙箱要杜绝的能力。
         """
+        self._assert_writable(f"{src_rel} -> {dst_rel}")
         src = self.resolve(src_rel)
         dst = self.resolve(dst_rel)
 

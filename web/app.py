@@ -190,11 +190,16 @@ def _execute(run: Run) -> None:
 
     try:
         ws = ensure_session(run.session_id)
+        store = get_store()
+        root_ids = [r.id for r in store.list_roots()] or None
         runner = AgentRunner(
             ws,
             llm=LLMClient(),
             trace=trace,
             token_budget=MAX_TOKENS_PER_TASK,
+            # 注册过目录就启用索引检索，否则退化为实时扫描
+            store=store if root_ids else None,
+            root_ids=root_ids,
         )
         result = runner.run(run.task)
         guard.add_tokens(result.usage.get("total_tokens", 0))
@@ -325,6 +330,106 @@ async def read_file(session_id: str, path: str) -> JSONResponse:
             "content": "".join(lines[:MAX_PREVIEW]),
         }
     )
+
+
+# ======================================================================
+# 索引管理 —— 让用户能注册任意文件夹
+# ======================================================================
+_store_lock = threading.Lock()
+_store: Any = None
+_index_jobs: dict[int, dict[str, Any]] = {}
+
+
+def get_store() -> Any:
+    global _store
+    with _store_lock:
+        if _store is None:
+            from agent.index.store import IndexStore
+            _store = IndexStore(ROOT / ".index" / "index.db")
+    return _store
+
+
+@app.get("/api/index/roots")
+async def index_roots() -> JSONResponse:
+    from agent.index.parsers import available_parsers
+    store = get_store()
+    roots = []
+    for r in store.list_roots():
+        run = store.last_run(r.id)
+        roots.append({
+            "id": r.id, "label": r.label, "path": r.path,
+            "status": _index_jobs.get(r.id, {}).get("status", r.status),
+            "last_scan_at": r.last_scan_at,
+            "progress": _index_jobs.get(r.id, {}).get("progress"),
+            "stats": {
+                "files_indexed": run["files_indexed"] if run else 0,
+                "files_failed": run["files_failed"] if run else 0,
+                "chunks": run["chunks_written"] if run else 0,
+            },
+        })
+    return JSONResponse({"roots": roots, "parsers": available_parsers(),
+                         "corpus": store.corpus_stats()})
+
+
+@app.post("/api/index/roots")
+async def index_add_root(payload: dict[str, Any],
+                         x_access_code: str | None = Header(None)) -> JSONResponse:
+    require_access(x_access_code or payload.get("access_code"))
+    path = str(payload.get("path") or "").strip()
+    if not path:
+        raise HTTPException(400, "path 不能为空")
+    try:
+        root = get_store().add_root(path, label=payload.get("label") or None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return JSONResponse({"id": root.id, "label": root.label, "path": root.path})
+
+
+@app.post("/api/index/sync/{root_id}")
+async def index_sync(root_id: int,
+                     x_access_code: str | None = Header(None)) -> JSONResponse:
+    """后台线程跑索引，前端轮询 /api/index/roots 看进度。"""
+    require_access(x_access_code)
+    store = get_store()
+    root = store.get_root(root_id=root_id)
+    if root is None:
+        raise HTTPException(404, "根目录不存在")
+    if _index_jobs.get(root_id, {}).get("status") == "scanning":
+        return JSONResponse({"status": "already_running"})
+
+    def work() -> None:
+        from agent.index.indexer import sync_root
+        _index_jobs[root_id] = {"status": "scanning", "progress": {}}
+        try:
+            p = sync_root(store, root,
+                          progress_cb=lambda pr: _index_jobs[root_id].update(
+                              {"progress": pr.as_dict()}))
+            _index_jobs[root_id] = {"status": "idle", "progress": p.as_dict()}
+        except Exception as exc:
+            _index_jobs[root_id] = {"status": "error", "error": str(exc)}
+
+    threading.Thread(target=work, daemon=True).start()
+    return JSONResponse({"status": "started"})
+
+
+@app.delete("/api/index/roots/{root_id}")
+async def index_remove_root(root_id: int,
+                            x_access_code: str | None = Header(None)) -> JSONResponse:
+    require_access(x_access_code)
+    get_store().remove_root(root_id)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/index/search")
+async def index_search(q: str, limit: int = 10) -> JSONResponse:
+    """直接检索（不经模型），用于前端的即时搜索框。"""
+    hits = get_store().search(q, limit=min(limit, 50))
+    return JSONResponse({"query": q, "hits": [
+        {"chunk_id": h.chunk_id, "root": h.root_label, "path": h.rel_path,
+         "locator": h.locator, "breadcrumb": h.breadcrumb,
+         "text": h.text[:400], "matched_by": h.matched_by}
+        for h in hits
+    ]})
 
 
 @app.get("/api/config")

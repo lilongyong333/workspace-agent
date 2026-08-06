@@ -33,7 +33,7 @@ from .prompts import (
     nudge_stuck,
 )
 from .sandbox import Sandbox
-from .tools import TOOL_SCHEMAS, ToolBox
+from .tools import ToolBox, build_tool_schemas
 from .trace import TraceRecorder
 
 
@@ -146,11 +146,22 @@ class AgentRunner:
         trace: TraceRecorder | None = None,
         max_steps: int | None = None,
         token_budget: int | None = None,
+        store: Any | None = None,
+        root_ids: list[int] | None = None,
+        read_only: bool = False,
     ) -> None:
-        self.sandbox = Sandbox(workspace)
+        self.sandbox = Sandbox(workspace, read_only=read_only)
         self.tools = ToolBox(
             self.sandbox,
             max_result_bytes=int(os.getenv("AGENT_TOOL_RESULT_MAX_BYTES", "8192")),
+            store=store,
+            root_ids=root_ids,
+        )
+        # 工具清单按能力装配：
+        #   有索引才暴露 describe_corpus / get_chunk；
+        #   只读模式直接不给 write_file / move_file —— 模型调不到看不见的工具。
+        self.tool_schemas = build_tool_schemas(
+            has_index=store is not None, read_only=read_only
         )
         self.llm = llm or LLMClient()
         self.trace = trace or TraceRecorder()
@@ -162,6 +173,7 @@ class AgentRunner:
         # 记录所有实际发生的写操作 —— DEGRADED 时靠它交付部分产物，
         # 而不是依赖模型自己声明（模型可能还没来得及说就被截断了）。
         self.written: list[str] = []
+        self._notified_stale: set[str] = set()
 
     # ==================================================================
     # 主循环
@@ -183,7 +195,9 @@ class AgentRunner:
 
             # ---- ② 模型决策 -----------------------------------------
             try:
-                reply = self.llm.complete(payload[1:], tools=TOOL_SCHEMAS, system=payload[0]["content"])
+                reply = self.llm.complete(
+                    payload[1:], tools=self.tool_schemas, system=payload[0]["content"]
+                )
             except LLMError as exc:
                 return self._finish(Outcome.FAILED, f"模型调用失败：{exc}", step)
 
@@ -245,6 +259,14 @@ class AgentRunner:
                         "content": self._render_result(result),
                     }
                 )
+
+            # 证据校验发现陈旧内容 —— 必须显式告知模型，
+            # 否则它只会看到"少了几条结果"，不知道那是被主动丢弃的。
+            for note in self.tools.stale_notes:
+                if note not in self._notified_stale:
+                    self._notified_stale.add(note)
+                    self.trace.note(step, "检测到索引陈旧，已丢弃失效证据并提示模型")
+                    self.messages.append({"role": "user", "content": note})
 
             # ---- ⑤ 判定：继续还是终止 ---------------------------------
             # 只有**整个回合一无所获**才算一次失败回合。

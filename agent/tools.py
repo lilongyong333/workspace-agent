@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from .sandbox import Sandbox, SandboxError
@@ -112,11 +113,31 @@ def wrap_untrusted(path: str, body: str) -> str:
 # 工具实现
 # ----------------------------------------------------------------------
 class ToolBox:
-    def __init__(self, sandbox: Sandbox, max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES) -> None:
+    """工具集。
+
+    ``store`` 可选：传入后 ``search`` 走索引（毫秒级，支持任意规模语料），
+    并额外解锁 ``describe_corpus`` / ``get_chunk`` 两个工具。
+    不传则退化为实时全量扫描 —— 小语料下同样正确，只是慢。
+
+    **工具集按能力动态装配**，而不是固定不变。这与"按权限装配工具"
+    是同一个原则：agent 能做什么，取决于运行环境给了它什么。
+    """
+
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+        store: Any | None = None,
+        root_ids: list[int] | None = None,
+    ) -> None:
         self.sb = sandbox
         self.max_result_bytes = max_result_bytes
+        self.store = store
+        self.root_ids = root_ids
         self.consecutive_errors = 0
         self.write_count = 0
+        # 本次运行中被证据校验判定为陈旧的条目，供 loop 提示模型
+        self.stale_notes: list[str] = []
 
     # -- list_dir ------------------------------------------------------
     def list_dir(self, path: str = ".", recursive: bool = False) -> ToolResult:
@@ -183,6 +204,13 @@ class ToolBox:
         if not pattern:
             return ToolResult(ok=False, error="pattern 不能为空")
 
+        # 有索引就走索引：毫秒级，且返回体带页码/行号等定位信息。
+        # 索引路径不支持正则，正则查询仍走实时扫描。
+        if self.store is not None and not regex:
+            indexed = self._search_indexed(pattern, path_glob, max_results)
+            if indexed is not None:
+                return indexed
+
         flags = re.I if ignore_case else 0
         try:
             rx = re.compile(pattern if regex else re.escape(pattern), flags)
@@ -232,6 +260,107 @@ class ToolBox:
             },
         )
 
+    # -- 索引检索 -------------------------------------------------------
+    def _search_indexed(
+        self, pattern: str, path_glob: str, max_results: int
+    ) -> ToolResult | None:
+        """索引检索 + **证据时效校验**。
+
+        校验是关键：索引与磁盘之间存在时间差，文件可能已被删除或修改。
+        不校验就直接引用，等于拿旧数据编答案 —— 这比检索不到更危险，
+        因为用户会直接相信一个错误的数字。
+
+        返回 None 表示索引不可用，由调用方回退到实时扫描。
+        """
+        from .index.verify import verify_hits
+
+        try:
+            prefix = None
+            if path_glob and path_glob != "**/*" and "*" not in path_glob:
+                prefix = path_glob.rstrip("/")
+            hits = self.store.search(
+                pattern,
+                limit=max(1, min(int(max_results), MAX_SEARCH_HITS)),
+                root_ids=self.root_ids,
+                path_prefix=prefix,
+            )
+        except Exception:
+            return None  # 索引出问题就退回实时扫描，不要让整条链路挂掉
+
+        report = verify_hits(self.store, hits)
+        if report.has_stale:
+            note = report.as_note()
+            if note and note not in self.stale_notes:
+                self.stale_notes.append(note)
+
+        data: dict[str, Any] = {
+            "pattern": pattern,
+            "engine": "index",
+            "total_hits": len(report.fresh),
+            "returned": len(report.fresh),
+            "hits": [
+                {
+                    "path": h.rel_path,
+                    "locator": h.locator,          # {"page":3} / {"sheet":"Q1","row":45} / {"line":120}
+                    "breadcrumb": h.breadcrumb,
+                    "text": h.text[:600],
+                    "chunk_id": h.chunk_id,
+                    "matched_by": h.matched_by,
+                }
+                for h in report.fresh
+            ],
+        }
+        if report.stale:
+            data["stale_discarded"] = report.stale
+            data["notice"] = report.as_note()
+        return ToolResult(ok=True, data=data)
+
+    # -- describe_corpus ------------------------------------------------
+    def describe_corpus(self) -> ToolResult:
+        """语料概览。
+
+        专门解决"这里都有什么"这类问题 —— 没有它，模型只能逐个 read_file，
+        既慢又烧 token，还容易钻进不必要的细节里出不来。
+        """
+        if self.store is None:
+            entries = self.sb.list_dir(".", recursive=True)
+            files = [e for e in entries if e.kind == "file"]
+            by_ext: dict[str, int] = {}
+            for f in files:
+                by_ext[Path(f.name).suffix.lower().lstrip(".") or "(无)"] = \
+                    by_ext.get(Path(f.name).suffix.lower().lstrip(".") or "(无)", 0) + 1
+            return ToolResult(ok=True, data={
+                "engine": "filesystem",
+                "documents": len(files),
+                "total_bytes": sum(f.size_bytes for f in files),
+                "by_extension": [{"ext": k, "count": v}
+                                 for k, v in sorted(by_ext.items(), key=lambda kv: -kv[1])[:20]],
+                "top_directories": _top_dirs([f.rel_path for f in files]),
+            })
+        return ToolResult(ok=True, data={"engine": "index",
+                                         **self.store.corpus_stats(self.root_ids)})
+
+    # -- get_chunk ------------------------------------------------------
+    def get_chunk(self, chunk_id: int) -> ToolResult:
+        """按 chunk_id 取回带定位信息的原文，供精确引用。"""
+        if self.store is None:
+            return ToolResult(ok=False, error="当前未启用索引，无法按 chunk_id 取原文")
+        hit = self.store.get_chunk(int(chunk_id))
+        if hit is None:
+            return ToolResult(ok=False, error=f"chunk {chunk_id} 不存在")
+
+        from .index.verify import verify_hits
+        report = verify_hits(self.store, [hit])
+        if not report.fresh:
+            return ToolResult(ok=False,
+                              error=f"该内容已失效：{report.stale[0]['reason']}，请重新检索")
+        return ToolResult(ok=True, data={
+            "chunk_id": hit.chunk_id, "path": hit.rel_path,
+            "breadcrumb": hit.breadcrumb, "locator": hit.locator,
+            "content_sha256": hit.content_sha256,
+            "text": wrap_untrusted(hit.rel_path, hit.text),
+        })
+
     # -- write_file ----------------------------------------------------
     def write_file(self, path: str, content: str) -> ToolResult:
         rel = self.sb.write_text(path, content)
@@ -256,6 +385,8 @@ class ToolBox:
         "search": "search",
         "write_file": "write_file",
         "move_file": "move_file",
+        "describe_corpus": "describe_corpus",
+        "get_chunk": "get_chunk",
     }
 
     def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
@@ -300,6 +431,15 @@ class ToolBox:
                 return [e.rel_path for e in self.sb.list_dir(".")][:30]
             except SandboxError:
                 return []
+
+
+def _top_dirs(paths: list[str], limit: int = 20) -> list[dict[str, object]]:
+    counts: dict[str, int] = {}
+    for p in paths:
+        top = p.split("/")[0] if "/" in p else "(根)"
+        counts[top] = counts.get(top, 0) + 1
+    return [{"dir": k, "count": v}
+            for k, v in sorted(counts.items(), key=lambda kv: -kv[1])[:limit]]
 
 
 # ----------------------------------------------------------------------
@@ -426,4 +566,60 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
-TOOL_NAMES = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
+# 仅在启用索引时才暴露给模型的工具。
+# 工具集按能力动态装配 —— 没有索引却告诉模型有 describe_corpus，
+# 只会让它调用失败然后困惑。
+INDEX_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_corpus",
+            "description": (
+                "返回整个语料的结构化概览：文档总数、按扩展名分布、顶层目录分布、"
+                "解析失败的文件列表。"
+                "**回答「这里都有什么」「帮我总结一下」这类概览问题时，先调用它**，"
+                "不要逐个 read_file —— 那样既慢又容易钻进不必要的细节。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chunk",
+            "description": (
+                "按 search 返回的 chunk_id 取回该片段的完整原文与精确定位"
+                "（页码 / 工作表+行号 / 行号）。用于在引用前核对原文。"
+                "若该片段对应的源文件已被修改或删除，会返回错误而不是过期内容。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"chunk_id": {"type": "integer"}},
+                "required": ["chunk_id"],
+            },
+        },
+    },
+]
+
+
+WRITE_TOOL_NAMES = {"write_file", "move_file"}
+
+
+def build_tool_schemas(has_index: bool = False, read_only: bool = False) -> list[dict[str, Any]]:
+    """按运行环境的能力装配工具清单。
+
+    ``read_only=True`` 时**根本不把 write_file / move_file 交给模型**，
+    而不是留着工具再在运行时拒绝。理由和「没有删除工具」完全一致：
+    模型无法调用一个它看不见的工具，这条边界不依赖任何提示词。
+    留着工具再拒绝的做法，只是把攻击面从「会不会被说服」换成
+    「拒绝逻辑有没有漏判」，边界强度反而下降。
+    """
+    base = TOOL_SCHEMAS
+    if read_only:
+        base = [s for s in base if s["function"]["name"] not in WRITE_TOOL_NAMES]
+    return [*base, *(INDEX_TOOL_SCHEMAS if has_index else [])]
+
+
+TOOL_NAMES = {schema["function"]["name"] for schema in TOOL_SCHEMAS} | {
+    s["function"]["name"] for s in INDEX_TOOL_SCHEMAS
+}

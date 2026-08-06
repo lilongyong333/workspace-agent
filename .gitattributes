@@ -1,0 +1,16 @@
+# 源码统一以 LF 入库，检出时按平台还原，避免 Windows 上产生无意义 diff。
+* text=auto eol=lf
+
+# workspace_seed/ 是测试夹具，必须逐字节保留原样。
+#
+# 这不是洁癖：种子文件里埋着五个刻意设计的陷阱（提示词注入、
+# 950KB 大文件、新旧矛盾、干扰项、名实不符），测试断言直接依赖它们的
+# 精确内容与行号（例如大日志的第 3601 / 8401 行）。任何换行符转换都会
+# 改变字节数与偏移，让「在别人机器上 clone 后行为一致」这条保证失效。
+workspace_seed/** -text -diff
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary

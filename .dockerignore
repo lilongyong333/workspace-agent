@@ -1,0 +1,21 @@
+# 别把密钥打进镜像
+.env
+.env.*
+!.env.example
+
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# 运行期产物
+sessions/
+workspace/
+trace.jsonl
+*.trace.jsonl
+
+.idea/
+.vscode/

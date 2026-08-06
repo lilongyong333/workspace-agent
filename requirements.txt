@@ -1,0 +1,20 @@
+# Runtime dependencies -- deliberately minimal.
+#
+# NOTE: this file must stay pure ASCII. pip reads requirements.txt using the
+# system locale codec on Windows (GBK on zh-CN), so non-ASCII comments make
+# `pip install -r requirements.txt` crash with UnicodeDecodeError -- even
+# though it works fine on Linux/macOS. Rationale and design notes live in
+# docs/DESIGN.md instead.
+#
+# No agent framework here on purpose: the assignment forbids any layer that
+# runs the agent loop for you (LangChain / LangGraph / CrewAI / OpenAI Agents
+# SDK / Claude Agent SDK / tool_runner). The loop is hand-written and model
+# calls go over plain HTTP via httpx.
+#
+# Versions below are the ones actually resolved and verified locally, not
+# guessed. Regenerate with `pip freeze` if you bump anything.
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+httpx==0.28.1
+python-dotenv==1.2.2

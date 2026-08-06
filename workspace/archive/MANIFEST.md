@@ -1,3 +1,0 @@
-- api-v1-spec.md
-- blog-post-launch.md
-- onboarding-guide.md

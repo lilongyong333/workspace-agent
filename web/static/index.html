@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workspace Agent</title>
+<style>
+  :root{
+    --bg:#191817; --panel:#211f1e; --panel-2:#262423; --line:#332f2c;
+    --fg:#eeece6; --dim:#a29a90; --faint:#6f675f;
+    --accent:#d97757; --ok:#7fb069; --warn:#d9a441; --err:#d76a6a;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.6;
+       -webkit-font-smoothing:antialiased}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#3a3532;border-radius:9px}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  /* ---------- layout ---------- */
+  .app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+  .body{display:grid;grid-template-columns:1fr 340px;min-height:0}
+  @media(max-width:920px){.body{grid-template-columns:1fr}.side{display:none}}
+
+  /* ---------- top bar ---------- */
+  .top{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);
+       background:var(--panel)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:600;letter-spacing:-.01em}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex:none}
+  .brand small{color:var(--faint);font-weight:400;font-size:12px}
+  .spacer{flex:1}
+  .stat{font-family:var(--mono);font-size:11.5px;color:var(--dim);white-space:nowrap}
+  .stat b{color:var(--fg);font-weight:600}
+  .btn{padding:5px 11px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;color:var(--dim);
+       transition:.15s}
+  .btn:hover{border-color:var(--accent);color:var(--fg)}
+
+  /* ---------- main ---------- */
+  .main{display:flex;flex-direction:column;min-height:0;min-width:0}
+  .stream{flex:1;overflow-y:auto;padding:18px 20px 8px;scroll-behavior:smooth}
+  .empty{color:var(--faint);max-width:620px;margin:6vh auto;text-align:center}
+  .empty h2{color:var(--fg);font-size:19px;margin:0 0 8px;font-weight:600}
+  .empty p{margin:0 0 22px;font-size:13.5px;line-height:1.75}
+
+  .chips{display:flex;flex-direction:column;gap:9px;text-align:left}
+  .chip{border:1px solid var(--line);border-radius:9px;padding:11px 14px;background:var(--panel);
+        transition:.15s;font-size:13px;color:var(--dim)}
+  .chip:hover{border-color:var(--accent);background:var(--panel-2);color:var(--fg)}
+  .chip b{display:block;color:var(--fg);font-weight:600;margin-bottom:3px;font-size:13px}
+
+  /* ---------- trace ---------- */
+  .row{display:flex;gap:11px;padding:5px 0;font-family:var(--mono);font-size:12.5px;
+       animation:in .2s ease-out}
+  @keyframes in{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+  .gutter{width:30px;flex:none;text-align:right;color:var(--faint);font-size:11px;padding-top:1px}
+  .cell{min-width:0;flex:1}
+  .tool{color:var(--accent);font-weight:600}
+  .args{color:var(--faint);word-break:break-all}
+  .res{color:var(--dim)}
+  .row.bad .res{color:var(--err)}
+  .think{font-family:var(--sans);color:var(--dim);font-style:italic;font-size:13px;
+         border-left:2px solid var(--line);padding-left:11px;margin:3px 0}
+  .note{color:var(--warn);font-size:12px}
+
+  .final{margin:16px 0 4px;border:1px solid var(--line);border-radius:11px;overflow:hidden;background:var(--panel)}
+  .final-hd{display:flex;align-items:center;gap:9px;padding:9px 14px;border-bottom:1px solid var(--line);
+            font-size:12px;font-family:var(--mono)}
+  .badge{padding:1.5px 8px;border-radius:5px;font-size:11px;font-weight:700;letter-spacing:.03em}
+  .badge.done{background:rgba(127,176,105,.16);color:var(--ok)}
+  .badge.degraded{background:rgba(217,164,65,.16);color:var(--warn)}
+  .badge.failed{background:rgba(215,106,106,.16);color:var(--err)}
+  .final-bd{padding:12px 15px;white-space:pre-wrap;font-size:13px;line-height:1.72}
+  .deliv{padding:0 15px 12px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .deliv a{color:var(--accent);text-decoration:none;cursor:pointer}
+  .deliv a:hover{text-decoration:underline}
+
+  /* ---------- composer ---------- */
+  .composer{border-top:1px solid var(--line);padding:12px 20px 15px;background:var(--panel)}
+  .box{display:flex;gap:10px;align-items:flex-end;border:1px solid var(--line);border-radius:11px;
+       padding:9px 11px;background:var(--bg);transition:.15s}
+  .box:focus-within{border-color:var(--accent)}
+  textarea{flex:1;background:none;border:none;outline:none;color:var(--fg);resize:none;font-family:var(--sans);
+           font-size:13.5px;line-height:1.6;max-height:150px;min-height:22px}
+  textarea::placeholder{color:var(--faint)}
+  .send{background:var(--accent);color:#1a1512;font-weight:600;border-radius:8px;padding:6px 15px;font-size:13px;
+        transition:.15s;flex:none}
+  .send:disabled{opacity:.35;cursor:not-allowed}
+  .hint{margin-top:7px;font-size:11px;color:var(--faint);font-family:var(--mono)}
+
+  /* ---------- side ---------- */
+  .side{border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+  .side-hd{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;
+           font-size:12px;color:var(--dim);font-family:var(--mono)}
+  .tree{flex:1;overflow-y:auto;padding:7px 0}
+  .node{display:flex;gap:8px;padding:3px 14px;font-family:var(--mono);font-size:12px;color:var(--dim);
+        cursor:pointer;transition:.1s}
+  .node:hover{background:var(--panel-2);color:var(--fg)}
+  .node.dir{color:var(--faint);cursor:default}
+  .node.dir:hover{background:none;color:var(--faint)}
+  .node.new{color:var(--ok)}
+  .node .sz{margin-left:auto;color:var(--faint);font-size:10.5px;flex:none}
+
+  /* ---------- viewer ---------- */
+  .veil{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;align-items:center;justify-content:center;
+        padding:26px;z-index:20;backdrop-filter:blur(3px)}
+  .veil.on{display:flex}
+  .sheet{background:var(--panel);border:1px solid var(--line);border-radius:13px;width:min(880px,100%);
+         max-height:82vh;display:flex;flex-direction:column;overflow:hidden}
+  .sheet-hd{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line);
+            font-family:var(--mono);font-size:12.5px}
+  .sheet pre{margin:0;padding:15px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.62;
+             white-space:pre-wrap;word-break:break-word;color:var(--dim)}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel-2);
+         border:1px solid var(--line);border-radius:9px;padding:9px 16px;font-size:12.5px;z-index:30;
+         display:none;box-shadow:0 8px 26px rgba(0,0,0,.4)}
+  .toast.on{display:block}
+  .spin{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);
+        animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="top">
+    <div class="brand"><span class="dot"></span>Workspace Agent<small id="model">—</small></div>
+    <div class="spacer"></div>
+    <div class="stat">调用 <b id="s-calls">0</b> · tokens <b id="s-tok">0</b> · 步 <b id="s-step">0</b></div>
+    <button class="btn" id="reset">重置工作区</button>
+  </div>
+
+  <div class="body">
+    <div class="main">
+      <div class="stream" id="stream">
+        <div class="empty" id="empty">
+          <h2>用自然语言指挥它整理文件</h2>
+          <p>Agent 自己决定调用哪些工具、按什么顺序。<br>下方会实时显示每一步：工具、参数、结果摘要。</p>
+          <div class="chips">
+            <button class="chip" data-t="1"><b>T1 · 跨文件索引</b>找出所有提到 "Project Falcon" 的文件，生成按月份分组的索引，开头写明项目当前的正式名称</button>
+            <button class="chip" data-t="2"><b>T2 · 受控清理</b>把 drafts/ 里 status: obsolete 的草稿归档到 archive/，生成 MANIFEST，其余文件一律不动</button>
+            <button class="chip" data-t="3"><b>自由提问</b>这个工作区里都有些什么？帮我总结一下目录结构和主要内容</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="box">
+          <textarea id="task" rows="1" placeholder="描述你要它做的事…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button class="send" id="send">运行</button>
+        </div>
+        <div class="hint" id="hint">同一个 agent 循环 · 无任务专用分支 · 无删除能力</div>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="side-hd"><span>工作区文件</span><span class="spacer"></span><span id="fcount">—</span></div>
+      <div class="tree" id="tree"></div>
+    </div>
+  </div>
+</div>
+
+<div class="veil" id="veil">
+  <div class="sheet">
+    <div class="sheet-hd"><span id="v-path"></span><span class="spacer"></span>
+      <span id="v-meta" style="color:var(--faint)"></span>
+      <button class="btn" onclick="closeViewer()">关闭</button></div>
+    <pre id="v-body"></pre>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const EX = {
+  1:'找出 workspace 里所有提到 "Project Falcon" 的文件，在 workspace 根目录生成 falcon_index.md：开头写明该项目当前的正式名称；正文按月份分组（## YYYY-MM 标题，月份取文件自身标注的日期），每个文件一行：- <相对路径> — <一句话摘要>',
+  2:'把 drafts/ 里所有内容标记为 status: obsolete 的草稿移动到 archive/（不存在则创建），并生成 archive/MANIFEST.md，每行 - <文件名> 登记被移动的文件。除此之外的任何文件都不许动。',
+  3:'这个工作区里都有些什么？帮我总结一下目录结构和主要内容。'
+};
+let sid = localStorage.getItem('sid') || '';
+let baseline = new Set();      // 运行前的文件集合，用于高亮新增
+let busy = false;
+
+function toast(m, ms=2600){ const t=$('#toast'); t.textContent=m; t.classList.add('on');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('on'), ms); }
+function esc(s){ return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function kb(n){ return n<1024 ? n+'B' : n<1048576 ? (n/1024).toFixed(0)+'K' : (n/1048576).toFixed(1)+'M'; }
+
+// ---------- session ----------
+async function initSession(reset=false){
+  const q = new URLSearchParams(); if(reset) q.set('reset','true'); if(sid) q.set('session_id', sid);
+  const r = await fetch('/api/session?'+q, {method:'POST'});
+  sid = (await r.json()).session_id; localStorage.setItem('sid', sid);
+  await loadTree();
+}
+async function loadTree(markNew=false){
+  const r = await fetch('/api/files?session_id='+sid);
+  const d = await r.json();
+  const files = d.entries.filter(e=>e.type==='file');
+  $('#fcount').textContent = files.length + ' 个文件';
+  if(!markNew) baseline = new Set(files.map(e=>e.path));
+  $('#tree').innerHTML = d.entries.map(e=>{
+    const depth = e.path.split('/').length - 1;
+    const name = e.path.split('/').pop();
+    const pad = 14 + depth*13;
+    if(e.type==='dir') return `<div class="node dir" style="padding-left:${pad}px">${esc(name)}/</div>`;
+    const isNew = markNew && !baseline.has(e.path);
+    return `<div class="node${isNew?' new':''}" style="padding-left:${pad}px" onclick="viewFile('${esc(e.path)}')">
+              ${isNew?'+ ':''}${esc(name)}<span class="sz">${kb(e.size)}</span></div>`;
+  }).join('');
+}
+async function viewFile(p){
+  const r = await fetch(`/api/file?session_id=${sid}&path=${encodeURIComponent(p)}`);
+  if(!r.ok){ toast('无法读取该文件'); return; }
+  const d = await r.json();
+  $('#v-path').textContent = p;
+  $('#v-meta').textContent = d.total_lines + ' 行' + (d.truncated ? '（仅显示前 400 行）' : '');
+  $('#v-body').textContent = d.content;
+  $('#veil').classList.add('on');
+}
+function closeViewer(){ $('#veil').classList.remove('on'); }
+$('#veil').onclick = e => { if(e.target.id==='veil') closeViewer(); };
+
+// ---------- stream ----------
+function add(html, cls=''){
+  $('#empty')?.remove();
+  const d = document.createElement('div');
+  d.className = 'row '+cls; d.innerHTML = html;
+  $('#stream').appendChild(d);
+  $('#stream').scrollTop = $('#stream').scrollHeight;
+  return d;
+}
+function render(ev){
+  if(ev.type==='tool'){
+    const a = JSON.stringify(ev.args||{});
+    add(`<div class="gutter">${ev.step}</div><div class="cell">
+         <span class="tool">${esc(ev.tool)}</span>
+         <span class="args">${esc(a.length>150 ? a.slice(0,150)+'…' : a)}</span>
+         <div class="res">${ev.ok?'└ ':'└ ✗ '}${esc(ev.result_summary||'')}</div></div>`,
+         ev.ok?'':'bad');
+    $('#s-step').textContent = ev.step;
+  }
+  else if(ev.type==='thinking'){
+    add(`<div class="gutter">${ev.step}</div><div class="cell"><div class="think">${esc(ev.text)}</div></div>`);
+  }
+  else if(ev.type==='note'){
+    add(`<div class="gutter">${ev.step}</div><div class="cell note">⚙ ${esc(ev.text)}</div>`);
+  }
+  else if(ev.type==='usage'){
+    $('#s-calls').textContent = ev.calls; $('#s-tok').textContent = ev.total_tokens.toLocaleString();
+  }
+  else if(ev.type==='result'){
+    const links = (ev.deliverables||[]).map(p=>`<a onclick="viewFile('${esc(p)}')">${esc(p)}</a>`).join(' · ');
+    const el = document.createElement('div');
+    el.className = 'final';
+    el.innerHTML = `<div class="final-hd"><span class="badge ${ev.outcome}">${ev.outcome.toUpperCase()}</span>
+        <span style="color:var(--faint)">${ev.steps} 步 · ${ev.usage.total_tokens.toLocaleString()} tokens
+        · ${ev.usage.calls} 次调用</span></div>
+      <div class="final-bd">${esc(ev.summary)}</div>
+      ${links?`<div class="deliv">产物：${links}</div>`:''}`;
+    $('#stream').appendChild(el);
+    $('#stream').scrollTop = $('#stream').scrollHeight;
+    loadTree(true);
+  }
+  else if(ev.type==='error'){
+    add(`<div class="gutter">!</div><div class="cell res" style="color:var(--err)">${esc(ev.message)}</div>`, 'bad');
+  }
+}
+
+async function run(){
+  const task = $('#task').value.trim();
+  if(!task || busy) return;
+  busy = true; $('#send').disabled = true;
+  $('#hint').innerHTML = '<span class="spin"></span> 运行中…';
+  add(`<div class="gutter">›</div><div class="cell" style="font-family:var(--sans);color:var(--fg)">${esc(task)}</div>`);
+  $('#task').value = ''; $('#task').style.height='auto';
+
+  try{
+    const r = await fetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({task, session_id: sid, access_code: localStorage.getItem('code')||''})});
+    if(r.status===401){
+      const c = prompt('需要访问口令：'); if(c){ localStorage.setItem('code', c); busy=false; $('#send').disabled=false; return run(); }
+      throw new Error('未提供访问口令');
+    }
+    if(!r.ok) throw new Error((await r.json()).detail || ('HTTP '+r.status));
+    const {run_id} = await r.json();
+
+    await new Promise(res=>{
+      const es = new EventSource('/api/events/'+run_id);
+      es.onmessage = e => {
+        const ev = JSON.parse(e.data);
+        if(ev.type==='end'){ es.close(); res(); return; }
+        render(ev);
+      };
+      es.onerror = () => { es.close(); res(); };
+    });
+  }catch(err){
+    render({type:'error', message:String(err.message||err)});
+  }finally{
+    busy=false; $('#send').disabled=false;
+    $('#hint').textContent='同一个 agent 循环 · 无任务专用分支 · 无删除能力';
+  }
+}
+
+// ---------- wiring ----------
+$('#send').onclick = run;
+$('#task').addEventListener('keydown', e=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); run(); }
+});
+$('#task').addEventListener('input', e=>{
+  e.target.style.height='auto'; e.target.style.height=Math.min(e.target.scrollHeight,150)+'px';
+});
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{
+  $('#task').value = EX[c.dataset.t];
+  $('#task').dispatchEvent(new Event('input')); $('#task').focus();
+});
+$('#reset').onclick = async ()=>{
+  if(busy){ toast('任务运行中，请稍候'); return; }
+  await initSession(true);
+  $('#stream').innerHTML = '';
+  $('#s-calls').textContent=$('#s-tok').textContent=$('#s-step').textContent='0';
+  toast('工作区已重置为初始状态');
+};
+
+(async ()=>{
+  await initSession();
+  try{
+    const c = await (await fetch('/api/config')).json();
+    $('#model').textContent = c.model;
+    if(c.access_code_required) $('#hint').textContent += ' · 需访问口令';
+  }catch{}
+})();
+</script>
+</body>
+</html>

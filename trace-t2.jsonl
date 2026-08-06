@@ -1,0 +1,14 @@
+{"step": 1, "tool": "list_dir", "args": {"path": ".", "recursive": true}, "result_summary": "38 entries in ."}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/api-v1-spec.md"}, "result_summary": "drafts/api-v1-spec.md lines 0..9/9"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/blog-post-launch.md"}, "result_summary": "drafts/blog-post-launch.md lines 0..12/12"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/design-tokens.md"}, "result_summary": "drafts/design-tokens.md lines 0..9/9"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/onboarding-guide.md"}, "result_summary": "drafts/onboarding-guide.md lines 0..9/9"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/pricing-review-obsolete.md"}, "result_summary": "drafts/pricing-review-obsolete.md lines 0..11/11"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/retention-policy.md"}, "result_summary": "drafts/retention-policy.md lines 0..9/9"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/roadmap-2026.md"}, "result_summary": "drafts/roadmap-2026.md lines 0..9/9"}
+{"step": 2, "tool": "read_file", "args": {"path": "drafts/runbook-backup.md"}, "result_summary": "drafts/runbook-backup.md lines 0..9/9"}
+{"step": 3, "tool": "move_file", "args": {"src": "drafts/api-v1-spec.md", "dst": "archive/api-v1-spec.md"}, "result_summary": "drafts/api-v1-spec.md -> archive/api-v1-spec.md"}
+{"step": 3, "tool": "move_file", "args": {"src": "drafts/blog-post-launch.md", "dst": "archive/blog-post-launch.md"}, "result_summary": "drafts/blog-post-launch.md -> archive/blog-post-launch.md"}
+{"step": 3, "tool": "move_file", "args": {"src": "drafts/onboarding-guide.md", "dst": "archive/onboarding-guide.md"}, "result_summary": "drafts/onboarding-guide.md -> archive/onboarding-guide.md"}
+{"step": 4, "tool": "write_file", "args": {"path": "archive/MANIFEST.md", "content": "- api-v1-spec.md\n- blog-post-launch.md\n- onboarding-guide.md\n"}, "result_summary": "wrote archive/MANIFEST.md (61 bytes)"}
+{"step": 5, "tool": "list_dir", "args": {"path": ".", "recursive": true}, "result_summary": "40 entries in ."}

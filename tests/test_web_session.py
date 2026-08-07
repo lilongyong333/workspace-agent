@@ -169,23 +169,42 @@ def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return c, store
 
 
-def test_upload_saves_folder_and_indexes_it(tmp_path: Path,
-                                            monkeypatch: pytest.MonkeyPatch) -> None:
-    """上传完必须立刻可检索 —— 否则用户传完就提问会得到「什么都没有」。"""
+def test_upload_returns_immediately_and_indexes_in_background(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """上传必须**立刻返回**，索引在后台跑。
+
+    实测：8 个文件 / 791KB，其中 6 个扫描件，开启视觉解析后同步索引要 57.9 秒。
+    Cloudflare 免费版 100 秒切断连接，浏览器直接抛 "Failed to fetch" ——
+    看起来像上传功能坏了，其实文件早就存好了，坏的只是"等结果"这件事。
+    """
+    import time
+
     c, store = _client(tmp_path, monkeypatch)
     sid = c.post("/api/session").json()["session_id"]
 
+    md = "# 2025 Q4 预算\n研发部 1,187,432 元\n".encode()
+    csv = b"vendor,amount\nMeridian,55000\n"
     r = c.post("/api/upload", data={"session_id": sid}, files=[
-        ("files", ("我的资料/预算/2025Q4.md",
-                   "# 2025 Q4 预算\n研发部 1,187,432 元\n".encode(), "text/markdown")),
-        ("files", ("我的资料/合同.csv", b"vendor,amount\nMeridian,55000\n", "text/csv")),
+        ("files", ("我的资料/预算/2025Q4.md", md, "text/markdown")),
+        ("files", ("我的资料/合同.csv", csv, "text/csv")),
     ])
     assert r.status_code == 200
     body = r.json()
     assert body["saved"] == 2
-    assert body["indexed_documents"] > 0
+    assert body["indexing"] is True, "响应应表明索引仍在进行"
+    assert body["root_id"], "前端要靠 root_id 轮询进度"
 
-    assert store.search("1,187,432", limit=3), "上传的内容必须马上能检索到"
+    # 文件在返回时就该已经落盘了 —— 后台跑的只是索引
+    ws = A.SESSIONS_DIR / sid
+    assert (ws / "uploads" / "我的资料" / "预算" / "2025Q4.md").is_file()
+
+    for _ in range(100):                      # 等后台线程完成，最多 10 秒
+        if A._index_jobs.get(body["root_id"], {}).get("status") == "idle":
+            break
+        time.sleep(0.1)
+
+    assert store.search("1,187,432", limit=3), "后台索引完成后必须可检索"
     assert store.search("Meridian", limit=3)
     store.close()
 
@@ -234,3 +253,45 @@ def test_upload_enforces_file_count_limit(tmp_path: Path,
                files=[("files", (f"f{i}.md", b"x", "text/markdown")) for i in range(5)])
     assert r.status_code == 400
     store.close()
+
+
+# ----------------------------------------------------------------------
+# 模型能力：视觉模型不能驱动 agent 循环
+# ----------------------------------------------------------------------
+def test_vision_only_model_is_excluded_from_the_picker(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不支持工具调用的模型必须**从选择器里消失**，而不是标个警告了事。
+
+    实测（同一套 tools 定义打同一个端点）：
+        qwen-vl-max   tool_calls 为空，只回一段文本
+        qwen-max      正常返回 tool_calls
+
+    选中 qwen-vl-max 会发生什么：模型不调工具，改用文本写出一段
+    Python 伪代码（write_file(...)、finish(...)），循环一步都推进不了，
+    界面上却"看起来有回复"—— 又一个静默失败。
+
+    与「没有删除工具」同一条原则：选不了的东西才是真的选不了。
+    """
+    from agent.llm import available_providers, model_supports_tools
+
+    monkeypatch.setenv("QWEN_API_KEY", "sk-test")
+    monkeypatch.setenv("QWEN_MODEL", "qwen-vl-max")     # 用户为了 OCR 这么配是很自然的
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+
+    models = {m["provider"]: m["model"] for m in available_providers()}
+    assert "qwen" in models, "千问不该整个消失 —— 应退回它能调工具的缺省模型"
+    assert models["qwen"] != "qwen-vl-max"
+    assert all(model_supports_tools(m) for m in models.values())
+
+
+def test_tool_capability_detection() -> None:
+    from agent.llm import model_supports_tools, model_supports_vision
+
+    assert not model_supports_tools("qwen-vl-max")
+    assert model_supports_tools("qwen-max")
+    assert model_supports_tools("deepseek-v4-flash")
+    # 视觉与工具是两件独立的事，不能互相推导
+    assert model_supports_vision("qwen-vl-max")
+    assert not model_supports_vision("qwen-max")

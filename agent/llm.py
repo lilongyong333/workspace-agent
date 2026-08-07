@@ -66,16 +66,41 @@ DEFAULT_MODELS: dict[str, str] = {
 # 再去困惑为什么图片读不出来。
 VISION_MODEL_PREFIXES = ("qwen-vl", "qwen2-vl", "gpt-4o", "gemini", "claude-", "glm-4v")
 
+# **不支持 function calling 的模型。**
+#
+# 这不是可选优化 —— agent 循环完全建立在工具调用之上。
+# 实测（同一套 tools 定义打同一个端点）：
+#   qwen-vl-max   tool_calls 字段为空，只回一段文本
+#   qwen-max      正常返回 tool_calls
+#   qwen-plus     正常返回 tool_calls
+#
+# 选了 qwen-vl-max 会发生什么：模型不调工具，改用**文本写出一段 Python 伪代码**
+# （write_file(...)、finish(...)），循环一步都推进不了，
+# 但界面上看起来"有回复"—— 又一个静默失败。
+#
+# 所以视觉模型只用于**索引阶段的图片转写**（VISION_MODEL），
+# 绝不能拿来驱动 agent 循环。这两件事要求相反，必须分开。
+NO_TOOL_CALL_PREFIXES = ("qwen-vl", "qwen2-vl", "qwen-audio", "qwen-omni")
+
 
 def model_supports_vision(model: str) -> bool:
     m = (model or "").lower()
     return any(m.startswith(p) for p in VISION_MODEL_PREFIXES)
 
 
+def model_supports_tools(model: str) -> bool:
+    m = (model or "").lower()
+    return not any(m.startswith(p) for p in NO_TOOL_CALL_PREFIXES)
+
+
 def available_providers() -> list[dict[str, Any]]:
     """列出**服务端已配置 key** 的 provider，供前端做模型选择器。
 
     只暴露名字与缺省模型，绝不外泄 key 本身。
+
+    不支持工具调用的模型会被**直接排除**，而不是列出来加个警告标签 ——
+    它一旦被选中，agent 循环一步都走不了却又"看起来有回复"。
+    与「没有删除工具」同一条原则：选不了的东西才是真的选不了。
     """
     default_provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
     out: list[dict[str, Any]] = []
@@ -91,6 +116,14 @@ def available_providers() -> list[dict[str, Any]]:
         model = (os.getenv(f"{name.upper()}_MODEL")
                  or (os.getenv("LLM_MODEL") if name == default_provider else None)
                  or DEFAULT_MODELS.get(name, ""))
+        if not model_supports_tools(model):
+            # 配成了视觉模型（多半是为了 OCR 才设的 {PROVIDER}_MODEL）——
+            # 那是索引阶段的事，不该出现在 agent 模型选择器里。
+            # 换用同一家能调工具的缺省模型；换不了就整个跳过。
+            fallback = DEFAULT_MODELS.get(name, "")
+            if not fallback or not model_supports_tools(fallback):
+                continue
+            model = fallback
         out.append({
             "provider": name,
             "model": model,

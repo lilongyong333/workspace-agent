@@ -821,14 +821,43 @@ $('#btn-tpl')&&($('#btn-tpl').onclick=()=>{
       if(r.status===401){say('访问口令不正确，上传未执行','bad');return;}
       const d=await r.json();
       if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
-      say(`已上传 <b>${d.saved}</b> 个文件，索引 ${d.indexed_documents} 文档 / ${d.indexed_chunks} 块`,'good');
+
+      say(`已上传 <b>${d.saved}</b> 个文件，正在建索引…`,'good');
       if(d.skipped_total) say(`${d.skipped_total} 个被拒绝：`+
         d.skipped.map(s=>esc(s.path)+'（'+esc(s.reason)+'）').join('；'),'bad');
-      (d.parse_failures||[]).forEach(f=>say('解析失败：'+esc(f.path),'bad'));
-      loadRoots(); loadTree(true);
-      toast(`上传完成，已建索引（${d.saved} 个文件）`);
+      loadTree(true);
+
+      /* 索引在后台跑，这里轮询进度。
+         扫描件要逐页调视觉模型，几十秒很正常 —— 同步等会被
+         Cloudflare 的 100 秒超时掐断，前端只会看到 "Failed to fetch"。 */
+      await pollIndex(d.root_id);
     }catch(e){ say('上传失败：'+esc(e.message),'bad'); }
     finally{ drop.classList.remove('busy'); bar.hidden=true; }
+  }
+
+  async function pollIndex(rootId){
+    for(let i=0;i<400;i++){                       // 最多约 10 分钟
+      await new Promise(r=>setTimeout(r,1500));
+      let d; try{ d=await (await fetch('/api/index/roots')).json(); }catch{ continue; }
+      const me=(d.roots||[]).find(x=>x.id===rootId);
+      loadRoots();
+      if(!me) continue;
+      const p=me.progress||{};
+      if(me.status==='scanning'){
+        const cur=p.current?('　'+esc(String(p.current).slice(-46))):'';
+        say(`建索引中… 已扫 ${p.files_seen||0} / 索引 ${p.files_indexed||0}`+
+            `${p.files_failed?' / 失败 '+p.files_failed:''}${cur}`);
+        continue;
+      }
+      if(me.status==='error'){ say('索引失败：'+esc(me.error||'未知错误'),'bad'); return; }
+      const c=d.corpus||{};
+      say(`索引完成：${c.documents||0} 文档 / ${c.chunks||0} 块`+
+          `${p.files_failed?`，${p.files_failed} 个解析失败`:''}`,'good');
+      (c.parse_failures||[]).slice(0,5).forEach(f=>say('解析失败：'+esc(f.path),'bad'));
+      toast('索引完成，可以提问了');
+      return;
+    }
+    say('索引仍在进行，可稍后在本面板查看进度');
   }
 
   const fromInput=inp=>[...inp.files].map(f=>({file:f,path:f.webkitRelativePath||f.name}));

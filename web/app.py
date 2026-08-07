@@ -458,19 +458,29 @@ async def upload_folder(
         target.write_bytes(body)
         saved.append(sb.rel(target))
 
-    # 上传完立刻建索引 —— 否则用户传完就提问会得到"什么都没有"
+    # 索引放到后台线程，**不能占着 HTTP 请求做**。
+    #
+    # 实测：8 个文件 / 791KB，其中 6 个是扫描件，开启视觉解析后本地耗时
+    # **57.9 秒** —— 每页都要调一次视觉模型。线上服务在美国、模型在国内，
+    # 只会更慢。而 Cloudflare 免费版 100 秒就切断连接（524），
+    # 浏览器那边直接抛 "Failed to fetch"，看起来像上传功能坏了。
+    #
+    # 文件其实已经存好了，坏的只是"等结果"这件事。所以：存完立刻返回，
+    # 索引进度交给前端轮询 /api/index/roots。
     store = get_store()
-    root_ids = _ensure_session_indexed(store, session_id, ws)
-    stats = store.corpus_stats(root_ids)
+    root = store.get_root(label=SESSION_ROOT_PREFIX + session_id)
+    if root is None:
+        root = store.add_root(str(ws), label=SESSION_ROOT_PREFIX + session_id)
+
+    _start_index_job(store, root.id)
 
     return JSONResponse({
         "saved": len(saved),
         "bytes": total,
         "skipped": skipped[:20],
         "skipped_total": len(skipped),
-        "indexed_documents": stats["documents"],
-        "indexed_chunks": stats["chunks"],
-        "parse_failures": stats["parse_failures"][:10],
+        "root_id": root.id,
+        "indexing": True,
     })
 
 
@@ -596,17 +606,13 @@ async def index_add_root(payload: dict[str, Any],
     return JSONResponse({"id": root.id, "label": root.label, "path": root.path})
 
 
-@app.post("/api/index/sync/{root_id}")
-async def index_sync(root_id: int,
-                     x_access_code: str | None = Header(None)) -> JSONResponse:
-    """后台线程跑索引，前端轮询 /api/index/roots 看进度。"""
-    require_access(x_access_code)
-    store = get_store()
+def _start_index_job(store: Any, root_id: int) -> str:
+    """在后台线程跑一次增量同步。已在跑就不重复启动。"""
+    if _index_jobs.get(root_id, {}).get("status") == "scanning":
+        return "already_running"
     root = store.get_root(root_id=root_id)
     if root is None:
-        raise HTTPException(404, "根目录不存在")
-    if _index_jobs.get(root_id, {}).get("status") == "scanning":
-        return JSONResponse({"status": "already_running"})
+        return "not_found"
 
     def work() -> None:
         from agent.index.indexer import sync_root
@@ -616,11 +622,23 @@ async def index_sync(root_id: int,
                           progress_cb=lambda pr: _index_jobs[root_id].update(
                               {"progress": pr.as_dict()}))
             _index_jobs[root_id] = {"status": "idle", "progress": p.as_dict()}
-        except Exception as exc:
+        except Exception as exc:                          # noqa: BLE001
+            log.exception("索引失败 root=%s", root_id)
             _index_jobs[root_id] = {"status": "error", "error": str(exc)}
 
     threading.Thread(target=work, daemon=True).start()
-    return JSONResponse({"status": "started"})
+    return "started"
+
+
+@app.post("/api/index/sync/{root_id}")
+async def index_sync(root_id: int,
+                     x_access_code: str | None = Header(None)) -> JSONResponse:
+    """后台线程跑索引，前端轮询 /api/index/roots 看进度。"""
+    require_access(x_access_code)
+    status = _start_index_job(get_store(), root_id)
+    if status == "not_found":
+        raise HTTPException(404, "根目录不存在")
+    return JSONResponse({"status": status})
 
 
 @app.delete("/api/index/roots/{root_id}")

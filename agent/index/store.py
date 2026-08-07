@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -173,14 +174,80 @@ class Hit:
     matched_by: list[str] = field(default_factory=list)
 
 
+class _Rows:
+    """已经取完的结果集。持有行数据而不是活的游标。"""
+
+    __slots__ = ("_rows", "lastrowid", "rowcount")
+
+    def __init__(self, rows: list[Any], lastrowid: int | None, rowcount: int) -> None:
+        self._rows, self.lastrowid, self.rowcount = rows, lastrowid, rowcount
+
+    def fetchone(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[Any]:
+        return self._rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _SerialConn:
+    """把 sqlite3 连接的访问串行化。
+
+    ``check_same_thread=False`` 只是关掉了 Python 的线程归属检查，
+    **并不代表这个连接可以被多个线程同时使用**。同一连接上并发 execute
+    会让游标状态互相踩踏 —— 轻则 ProgrammingError，重则读到别人查询的结果。
+
+    本项目确实会并发：上传后在后台线程建索引（扫描件走视觉解析要几十秒），
+    与此同时用户完全可以提问，从请求线程触发检索。
+
+    关键细节：**execute 时就把结果取完**再返回。
+    只锁住 execute、把游标交出去在锁外 fetch 是无效的 ——
+    另一个线程可以在这中间用同一连接执行别的语句，让游标失效。
+    本项目所有查询都带 LIMIT，一次取完的内存代价可以忽略。
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._c = conn
+        self._lock = threading.RLock()
+
+    def execute(self, sql: str, params: Any = ()) -> _Rows:
+        with self._lock:
+            cur = self._c.execute(sql, params)
+            rows = cur.fetchall() if cur.description else []
+            return _Rows(rows, cur.lastrowid, cur.rowcount)
+
+    def executemany(self, sql: str, seq: Any) -> _Rows:
+        with self._lock:
+            cur = self._c.executemany(sql, seq)
+            return _Rows([], cur.lastrowid, cur.rowcount)
+
+    def executescript(self, sql: str) -> None:
+        with self._lock:
+            self._c.executescript(sql)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._c.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._c.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._c, name)
+
+
 class IndexStore:
     """索引库。默认落在 ``<repo>/.index/index.db``。"""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        raw = sqlite3.connect(self.db_path, check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        self.conn = _SerialConn(raw)
         self.conn.executescript(_SCHEMA)
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",

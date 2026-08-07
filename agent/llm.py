@@ -38,6 +38,11 @@ _PROVIDERS: dict[str, tuple[str, Wire]] = {
     "moonshot": ("https://api.moonshot.cn/v1", "openai"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "openai"),
     "anthropic": ("https://api.anthropic.com/v1", "anthropic"),
+    # 通义千问（阿里云百炼）。DashScope 提供 OpenAI 兼容端点，
+    # 所以走同一条 openai wire，不需要为它写第二套请求/响应转换。
+    # 这正是「多 provider 适配」的意义：新增一家通常只是加一行。
+    "qwen": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "openai"),
+    "dashscope": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "openai"),
 }
 
 

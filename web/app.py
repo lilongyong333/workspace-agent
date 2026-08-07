@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import shutil
@@ -46,10 +47,13 @@ from typing import Any, Iterator
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from agent.index.indexer import sync_root
 from agent.llm import LLMClient, LLMError
 from agent.loop import AgentRunner
 from agent.sandbox import Sandbox, SandboxError
 from agent.trace import TraceRecorder
+
+log = logging.getLogger("workspace-agent.web")
 
 ROOT = Path(__file__).resolve().parents[1]
 SEED_DIR = ROOT / "workspace_seed"
@@ -71,7 +75,17 @@ def _env_int(name: str, default: int) -> int:
 
 ACCESS_CODE = os.getenv("DEMO_ACCESS_CODE", "").strip()
 RATE_LIMIT_PER_HOUR = _env_int("DEMO_RATE_LIMIT_PER_HOUR", 20)
-MAX_TOKENS_PER_TASK = _env_int("DEMO_MAX_TOKENS_PER_TASK", 80_000)
+# 单任务 token 硬上限。
+#
+# 原来是 80,000 —— 定得太紧：一句「按目录和文件类型总结主要内容」
+# 在没有语料提纲时要 40K~54K，稍大一点的语料直接撞顶，
+# 正经指令跑不完却以 DEGRADED 收场，看起来像 agent 不行，其实是闸门设错了。
+#
+# 加了 describe_corpus 的逐文件提纲后，同一个问题降到 8.3K，
+# 所以这个上限的真实作用回归本意：**只拦恶意长任务，不拦正常任务**。
+# 配合每小时任务数与全局日预算两道闸，150K 是够用且安全的量级。
+# 线上可用环境变量直接调，不必改代码重新部署。
+MAX_TOKENS_PER_TASK = _env_int("DEMO_MAX_TOKENS_PER_TASK", 150_000)
 DAILY_TOKEN_BUDGET = _env_int("DEMO_DAILY_TOKEN_BUDGET", 2_000_000)
 MAX_TASK_CHARS = 2_000
 
@@ -153,14 +167,49 @@ def session_dir(session_id: str) -> Path:
     return SESSIONS_DIR / session_id
 
 
+SESSION_ROOT_PREFIX = "session:"
+
+
 def ensure_session(session_id: str, reset: bool = False) -> Path:
     ws = session_dir(session_id)
     if reset and ws.exists():
         shutil.rmtree(ws)
+        # 工作区重建后，旧索引描述的是一批已经不存在的文件。
+        # 不清掉的话，重置之后第一次提问会拿到上一轮的残留内容 ——
+        # 而且因为"有出处"，看起来还很可信。
+        _drop_session_index(session_id)
     if not ws.exists():
         ws.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(SEED_DIR, ws)
     return ws
+
+
+def _drop_session_index(session_id: str) -> None:
+    try:
+        store = get_store()
+        root = store.get_root(label=SESSION_ROOT_PREFIX + session_id)
+        if root is not None:
+            store.remove_root(root.id)
+    except Exception:                                    # noqa: BLE001
+        # 索引是加速层，不是正确性依赖：清理失败不该让重置失败。
+        # 下一次 sync 会把不存在的文件从索引里移除，最终一致。
+        log.exception("清理会话索引失败: %s", session_id)
+
+
+def _ensure_session_indexed(store: Any, session_id: str, ws: Path) -> list[int]:
+    """把会话工作区注册进索引并增量同步，返回本次检索可用的 root id 列表。
+
+    同时带上用户自己注册的目录 —— 那是「索引我的文件夹」这个功能的入口。
+    """
+    label = SESSION_ROOT_PREFIX + session_id
+    root = store.get_root(label=label)
+    if root is None:
+        root = store.add_root(str(ws), label=label)
+    sync_root(store, root)
+
+    others = [r.id for r in store.list_roots()
+              if r.id != root.id and not r.label.startswith(SESSION_ROOT_PREFIX)]
+    return [root.id, *others]
 
 
 # ======================================================================
@@ -191,14 +240,24 @@ def _execute(run: Run) -> None:
     try:
         ws = ensure_session(run.session_id)
         store = get_store()
-        root_ids = [r.id for r in store.list_roots()] or None
+        # 会话工作区**始终**建索引，不再"注册过目录才启用"。
+        #
+        # 原来的写法（store=store if root_ids else None）让默认演示彻底拿不到
+        # describe_corpus，模型只能逐个 read_file。实测一句
+        # "总结一下目录结构和主要内容" 要 40K~54K tokens、42 次 read_file，
+        # 逼近单任务 80K 上限，经常以 DEGRADED 收场。
+        # 建好索引后同一个问题是 2 步 / 8.3K tokens / 0 次 read_file。
+        #
+        # 成本：32 个文件约 0.5 秒，且增量同步在无变更时是毫秒级。
+        # 必须每次跑之前同步 —— 上一次任务可能改过工作区，
+        # 陈旧索引会让模型引用到已经不存在的内容。
+        root_ids = _ensure_session_indexed(store, run.session_id, ws)
         runner = AgentRunner(
             ws,
             llm=LLMClient(),
             trace=trace,
             token_budget=MAX_TOKENS_PER_TASK,
-            # 注册过目录就启用索引检索，否则退化为实时扫描
-            store=store if root_ids else None,
+            store=store,
             root_ids=root_ids,
         )
         result = runner.run(run.task)

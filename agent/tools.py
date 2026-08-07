@@ -337,8 +337,15 @@ class ToolBox:
                                  for k, v in sorted(by_ext.items(), key=lambda kv: -kv[1])[:20]],
                 "top_directories": _top_dirs([f.rel_path for f in files]),
             })
-        return ToolResult(ok=True, data={"engine": "index",
-                                         **self.store.corpus_stats(self.root_ids)})
+        # 统计只回答"目录结构"，提纲才回答"主要内容"。
+        # A/B 实测：只给统计时，模型拿到概览后**照样把 32 个文件全读了**，
+        # token 仅降 13% —— 因为统计里没有一个字是内容。
+        # 补上逐文件的标题 + 小标题 + 首段预览之后，这一个调用就答得上来了。
+        return ToolResult(ok=True, data={
+            "engine": "index",
+            **self.store.corpus_stats(self.root_ids),
+            "outline": self.store.outline(self.root_ids),
+        })
 
     # -- get_chunk ------------------------------------------------------
     def get_chunk(self, chunk_id: int) -> ToolResult:
@@ -575,10 +582,13 @@ INDEX_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "describe_corpus",
             "description": (
-                "返回整个语料的结构化概览：文档总数、按扩展名分布、顶层目录分布、"
-                "解析失败的文件列表。"
-                "**回答「这里都有什么」「帮我总结一下」这类概览问题时，先调用它**，"
-                "不要逐个 read_file —— 那样既慢又容易钻进不必要的细节。"
+                "一次调用返回整个语料的全貌，包含两部分："
+                "(1) 结构统计 —— 文档总数、扩展名分布、顶层目录分布、解析失败清单；"
+                "(2) **逐文件提纲 outline** —— 每个文件的标题、前几个小标题、首段预览。"
+                "也就是说，「有哪些文件」和「每个文件讲什么」这两件事它都答得上来，"
+                "回答「这里都有什么」「总结一下目录结构和主要内容」通常**一次调用就够**。"
+                "只有当提纲不足以支撑结论、需要具体数字或原句时，才对**特定文件**"
+                "再用 search 或 read_file 深入。"
             ),
             "parameters": {"type": "object", "properties": {}},
         },

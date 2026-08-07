@@ -547,6 +547,77 @@ class IndexStore:
                       for r in self.list_roots()],
         }
 
+    # 每个文件在提纲里最多露出几个小标题
+    OUTLINE_HEADINGS_PER_DOC = 3
+    OUTLINE_PREVIEW_CHARS = 90
+
+    def outline(
+        self, root_ids: Sequence[int] | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """逐文件提纲：标题 + 小标题 + 首段预览。
+
+        ## 为什么需要这个
+
+        A/B 实测（同一问题、同一套工具，只改有无索引）暴露了一个设计缺口：
+        模型拿到 ``describe_corpus`` 之后，**照样把 32 个文件全读了一遍**，
+        token 只降 13%。
+
+        原因是 ``corpus_stats`` 返回的全是**形状**（文件数、字节数、扩展名分布），
+        没有一个字是**内容**。而用户问的是「目录结构**和主要内容**」——
+        统计只回答了前半句，模型别无选择只能逐个 read_file。
+
+        这不是模型不听话，是工具没能回答它该回答的问题。
+
+        修法沿用项目一贯的思路：**让便宜的工具真正答得上来，
+        模型自然就不去够贵的那个**——和「read_file 不提供读全文选项」是同一条原则。
+
+        素材是现成的：切块时每块都带了面包屑（``文件 > 章节 > 表头``），
+        这里只要把它们按文件聚合起来即可，不需要任何额外解析或模型调用。
+        """
+        cond, params = ("WHERE d.root_id IN (%s)" % ",".join("?" * len(root_ids)), list(root_ids)) \
+            if root_ids else ("", [])
+
+        # 只取每个文件靠前的几块：提纲不需要全文，而且这样把行数钉死在可控范围
+        rows = self.conn.execute(
+            f"""SELECT d.rel_path, d.ext, d.size_bytes, d.title, d.parse_error,
+                       c.breadcrumb, c.text, c.ordinal
+                FROM documents d
+                LEFT JOIN chunks c ON c.doc_id = d.id AND c.ordinal < 8
+                {cond}
+                ORDER BY d.rel_path, c.ordinal""",
+            params,
+        ).fetchall()
+
+        docs: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            path = r["rel_path"]
+            doc = docs.get(path)
+            if doc is None:
+                if len(docs) >= limit:
+                    continue
+                doc = docs[path] = {
+                    "path": path,
+                    "ext": r["ext"] or "",
+                    "size_bytes": r["size_bytes"],
+                    "title": r["title"] or "",
+                    "headings": [],
+                    "preview": "",
+                }
+                if r["parse_error"]:
+                    doc["parse_error"] = r["parse_error"][:120]
+
+            if r["text"] and not doc["preview"]:
+                doc["preview"] = " ".join(r["text"].split())[: self.OUTLINE_PREVIEW_CHARS]
+
+            # 面包屑形如「路径 > 章节 > 小节」，去掉路径部分就是标题层级
+            crumb = r["breadcrumb"] or ""
+            tail = [p.strip() for p in crumb.split(" > ")[1:] if p.strip()]
+            for h in tail:
+                if h not in doc["headings"] and len(doc["headings"]) < self.OUTLINE_HEADINGS_PER_DOC:
+                    doc["headings"].append(h)
+
+        return list(docs.values())
+
     # ------------------------------------------------------------------
     def start_run(self, root_id: int) -> int:
         cur = self.conn.execute(

@@ -742,7 +742,11 @@ $('#btn-reset').onclick=async()=>{
   try{const c=await (await fetch('/api/config')).json();
     $('#model').textContent=c.model; buildModelMenu(c.models||[]);
     // 数据会不会丢，必须在用户上传**之前**就看到，而不是文件没了才发现
-    if(c.persistent_storage===false) $('#persist-warn').hidden=false;
+    if(c.persistent_storage===false){
+      $('#persist-warn').hidden=false;
+      if(c.storage_problem)                       // 配了持久卷却没生效 —— 说清楚为什么
+        $('#persist-warn').innerHTML='⚠️ 持久化配置未生效：'+esc(c.storage_problem);
+    }
   }catch{}
   loadRoots();
 })();

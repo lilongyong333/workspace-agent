@@ -81,7 +81,36 @@ SEED_DIR = ROOT / "workspace_seed"
 #
 # 设成环境变量，就能把 Railway Volume 挂到这里实现持久化：
 #     DATA_DIR=/data   （并在 Railway 把 Volume 挂载到 /data）
-DATA_DIR = Path(os.getenv("DATA_DIR") or ROOT).resolve()
+def _pick_data_dir() -> tuple[Path, str | None]:
+    """确定数据落点，并**当场验证真的写得进去**。
+
+    挂载点的属主是运维侧的事，应用无法控制：容器以非 root 运行时，
+    root 属主的挂载点会让进程写不进去。若等到用户点"新建会话"才炸，
+    表现是一个 500 —— 完全看不出跟"挂了个卷"有关系，排查方向从一开始就是错的。
+
+    所以启动时就试写一次。失败就退回代码目录继续服务（数据不持久，
+    但功能完整），并把原因记进 config 让界面明说 ——
+    **降级 + 说实话，好过一个语焉不详的 500。**
+    """
+    want = os.getenv("DATA_DIR")
+    if not want:
+        return ROOT, None
+    d = Path(want).resolve()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return d, None
+    except OSError as exc:
+        reason = (f"DATA_DIR={want} 不可写（{exc.__class__.__name__}: {exc}），"
+                  f"已退回非持久目录。容器多半以非 root 运行，"
+                  f"而挂载点属主是 root —— 需要在镜像里预建该目录并 chown。")
+        log.error(reason)
+        return ROOT, reason
+
+
+DATA_DIR, DATA_DIR_PROBLEM = _pick_data_dir()
 SESSIONS_DIR = DATA_DIR / "sessions"
 INDEX_DB = DATA_DIR / ".index" / "index.db"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -171,6 +200,9 @@ class Guard:
                 # 用户传完文件、服务一重启就全没了，界面上只表现为
                 # "什么都搜不到"，极易被误判成检索坏了。
                 "persistent_storage": DATA_DIR != ROOT,
+                # 配了 DATA_DIR 却写不进去时，把原因原样端出来 ——
+                # 运维配置错了应该看得见，而不是靠猜。
+                "storage_problem": DATA_DIR_PROBLEM,
             }
 
 

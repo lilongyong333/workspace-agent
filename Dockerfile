@@ -20,8 +20,14 @@ COPY . .
 
 # 以非 root 运行。这个应用会在容器内读写文件，
 # 万一沙箱被绕过，非特权用户能显著限制影响范围。
+#
+# /data 必须**在切换用户之前**建好并授权：持久卷会挂到这里，
+# 而挂载点默认属主是 root —— 非特权进程写不进去，
+# 表现是建会话直接 500，且看不出跟"挂了个卷"有什么关系。
+# 镜像里先建好同名目录并 chown，挂载时才有正确的属主可继承。
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data \
+    && chown -R appuser:appuser /app /data
 USER appuser
 
 # Railway 通过 $PORT 注入端口，本地默认 8000

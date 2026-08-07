@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -199,6 +200,7 @@ class IndexStore:
     # ------------------------------------------------------------------
     # 根目录
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def add_root(
         self,
         path: str | Path,
@@ -208,7 +210,8 @@ class IndexStore:
     ) -> Root:
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_dir():
-            raise ValueError(f"不是一个目录: {resolved}")
+            hint = foreign_path_hint(str(path), on_windows=os.name == "nt")
+            raise ValueError(f"不是一个目录: {resolved}" + (f"。{hint}" if hint else ""))
         label = label or resolved.name
         self.conn.execute(
             """INSERT INTO roots(path, label, include_globs, exclude_globs, created_at)
@@ -645,6 +648,24 @@ class IndexStore:
 
 
 # ----------------------------------------------------------------------
+def foreign_path_hint(raw: str, on_windows: bool) -> str | None:
+    """路径注册失败时，判断是不是「填了自己电脑的路径」。
+
+    托管部署上，用户填 ``D:\\我的资料`` 是最自然的动作 ——
+    但服务跑在 Linux 容器里，看不到他本机的磁盘。
+    只回一句「不是一个目录」，人会反复检查那条其实没写错的路径。
+    技术上正确、实际上没用的报错，比报错本身更浪费时间。
+
+    做成纯函数是为了可测：直接 patch ``os.name`` 会让 pathlib 崩溃
+    （它靠这个决定用 PosixPath 还是 WindowsPath）。
+    """
+    looks_windows = (len(raw) > 1 and raw[1] == ":") or "\\" in raw
+    if looks_windows and not on_windows:
+        return ("这看起来是一个 Windows 路径，而本服务运行在 Linux 上 —— "
+                "服务器看不到你本机的磁盘。请改用「从你的电脑上传文件夹」。")
+    return None
+
+
 def _rrf(rankings: list[list[int]], k: int = 60) -> list[tuple[int, float]]:
     """Reciprocal Rank Fusion。
 

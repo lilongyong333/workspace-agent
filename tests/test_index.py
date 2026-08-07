@@ -341,3 +341,31 @@ def test_pdf_without_text_layer_is_reported_not_swallowed(tmp_path: Path,
     assert not doc.ok
     text = (doc.error or "") + " ".join(doc.warnings)
     assert "扫描" in text or "无可抽取文本" in text
+
+
+def test_windows_path_on_linux_points_at_the_upload_option() -> None:
+    """线上填自己电脑的路径时，报错必须点破真实原因。
+
+    用户在托管 Demo 上填 Windows 路径是最自然的动作，
+    但服务跑在 Linux 容器里，看不到他本机的磁盘。
+    只回一句「不是一个目录」会让人反复检查那条其实没写错的路径 ——
+    技术上正确、实际上没用的报错，比报错本身更浪费时间。
+    """
+    from agent.index.store import foreign_path_hint
+
+    B = chr(92)
+    win = ["D:" + B + "我的资料", "C:" + B + "Users" + B + "me", "docs" + B + "sub"]
+    for raw in win:
+        hint = foreign_path_hint(raw, on_windows=False)
+        assert hint and "上传" in hint, raw
+
+    # 服务本身跑在 Windows 上时，这就是条正常路径，不该给这个提示
+    assert foreign_path_hint(win[0], on_windows=True) is None
+
+
+def test_plain_missing_dir_keeps_the_plain_message() -> None:
+    """普通的路径写错不该被套上「用上传吧」—— 那会把人往错方向带。"""
+    from agent.index.store import foreign_path_hint
+
+    for raw in ("/var/nonexistent", "./docs", "~/data"):
+        assert foreign_path_hint(raw, on_windows=False) is None

@@ -52,6 +52,9 @@
 }
 
 *{box-sizing:border-box;margin:0;padding:0}
+/* 作者样式里的 display 会盖过浏览器默认的 [hidden]{display:none}，
+   于是「明明设了 hidden 却还显示出来」。统一钉死，省掉一类幽灵元素。 */
+[hidden]{display:none!important}
 html,body{height:100%}
 body{background:var(--bg-canvas);color:var(--text-1);font:var(--fs-base)/var(--lh-base) var(--sans);
      -webkit-font-smoothing:antialiased;overflow:hidden}
@@ -205,6 +208,7 @@ textarea::placeholder{color:var(--text-3)}
 .tag-btn{cursor:pointer;transition:var(--d-fast) var(--ease-out)}
 .tag-btn:hover{color:var(--text-1);border-color:var(--accent)}
 .tag-btn::after{content:"⌄";margin-left:5px;opacity:.6}
+.menu.up{top:auto;bottom:calc(100% + 6px)}
 .menu{position:absolute;top:calc(100% + 6px);left:0;z-index:60;min-width:230px;
       background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--r-md);
       box-shadow:0 10px 34px rgb(0 0 0/.24);padding:4px;display:flex;flex-direction:column;gap:2px}
@@ -330,10 +334,6 @@ textarea::placeholder{color:var(--text-3)}
 <div class="app">
   <header class="top">
     <div class="logo"><span class="pip"></span>Workspace Agent</div>
-    <div class="model-pick">
-      <button class="tag tag-btn" id="model" aria-haspopup="listbox" aria-expanded="false">—</button>
-      <div class="menu" id="model-menu" role="listbox" hidden></div>
-    </div>
     <div class="grow"></div>
     <div class="metrics">
       <span>调用 <b id="m-calls">0</b></span>
@@ -378,11 +378,17 @@ textarea::placeholder{color:var(--text-3)}
           <button class="send" id="send">运行</button>
         </div>
         <div class="hint" id="hint">
-          <span id="status">同一个循环 · 无任务专用分支 · 无删除能力</span>
+          <div class="model-pick">
+            <button class="tag tag-btn" id="model" aria-haspopup="listbox"
+                    aria-expanded="false" title="切换模型">—</button>
+            <div class="menu up" id="model-menu" role="listbox" hidden></div>
+          </div>
           <span class="sep">·</span>
           <label class="ro" title="只向模型暴露只读工具：write_file / move_file 根本不进工具清单">
             <input type="checkbox" id="readonly"><span>只读模式</span>
           </label>
+          <span class="sep">·</span>
+          <span id="status">同一个循环 · 无删除能力</span>
           <span class="grow"></span>
           <span id="mic-hint"></span>
           <span><span class="kbd">⌘K</span> 搜索</span>
@@ -475,6 +481,35 @@ function toast(m,ms=2600){const t=$('#toast');t.textContent=m;t.classList.add('o
   clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('on'),ms);}
 function hdrs(){const h={'Content-Type':'application/json'};if(code)h['X-Access-Code']=code;return h;}
 
+/* ── 带口令的请求 ──────────────────────────────────────────
+   401 时问一次口令并**自动重试**。
+
+   之前 6 个调用点各写各的 `if(401){askCode();return;}` ——
+   弹窗、存下口令、然后就没有然后了。用户输完口令，
+   界面上什么都不会发生，看起来像"上传坏了"。
+   实际上后端一直是好的，断的是前端这一步。
+
+   把它收敛成一个函数，就不存在"某处忘了重试"这种事了。      */
+function askCode(){
+  const c = prompt('需要访问口令：');
+  if(!c) return false;
+  code = c; localStorage.setItem('code', c);
+  return true;
+}
+
+async function api(url, opts = {}, form = false){
+  const build = () => {
+    // FormData 必须让浏览器自己带 boundary，绝不能手动设 Content-Type
+    const h = form ? {} : {'Content-Type':'application/json'};
+    if(code) h['X-Access-Code'] = code;
+    return {...opts, headers: {...h, ...(opts.headers || {})}};
+  };
+  let r = await fetch(url, build());
+  if(r.status === 401 && askCode()) r = await fetch(url, build());
+  if(r.status === 401) toast('访问口令不正确');
+  return r;
+}
+
 /* ── 主题 ── */
 const setTheme = t => {document.documentElement.dataset.theme=t;localStorage.setItem('theme',t);};
 setTheme(localStorage.getItem('theme')||'dark');
@@ -546,26 +581,24 @@ async function loadRoots(){
   if(d.roots.some(r=>r.status==='scanning')) setTimeout(loadRoots,1200);
 }
 async function syncRoot(id){
-  const r=await fetch('/api/index/sync/'+id,{method:'POST',headers:hdrs()});
-  if(r.status===401){askCode();return;}
+  const r=await api('/api/index/sync/'+id,{method:'POST'});
+  if(!r.ok)return;
   toast('索引已开始'); setTimeout(loadRoots,400);
 }
 async function removeRoot(id){
-  const r=await fetch('/api/index/roots/'+id,{method:'DELETE',headers:hdrs()});
-  if(r.status===401){askCode();return;}
+  const r=await api('/api/index/roots/'+id,{method:'DELETE'});
+  if(!r.ok)return;
   toast('已移除（原文件未受影响）'); loadRoots();
 }
 $('#btn-add-root').onclick=async()=>{
   const path=$('#root-path').value.trim(); if(!path){toast('请填写路径');return;}
-  const r=await fetch('/api/index/roots',{method:'POST',headers:hdrs(),
+  const r=await api('/api/index/roots',{method:'POST',
     body:JSON.stringify({path,label:$('#root-label').value.trim()||null})});
-  if(r.status===401){askCode();return;}
+  if(r.status===401)return;
   if(!r.ok){toast((await r.json()).detail||'注册失败');return;}
   const d=await r.json(); $('#root-path').value=$('#root-label').value='';
   toast('已注册，开始索引…'); await syncRoot(d.id);
 };
-function askCode(){const c=prompt('需要访问口令：');if(c){code=c;localStorage.setItem('code',c);}}
-
 /* ── ⌘K 命令面板 ── */
 let palSel=0, palItems=[];
 function openPal(){$('#pal-scrim').classList.add('on');$('#pal-input').value='';
@@ -662,12 +695,12 @@ async function run(){
      <div class="skel" style="width:34%;margin-top:7px"></div></div>`,'skel-row');
 
   try{
-    const r=await fetch('/api/run',{method:'POST',headers:hdrs(),
+    const r=await api('/api/run',{method:'POST',
       body:JSON.stringify({task,session_id:sid,access_code:code,
         provider:picked?picked.provider:undefined,
         model:picked?picked.model:undefined,
         read_only:$('#readonly').checked})});
-    if(r.status===401){skel.remove();askCode();busy=false;$('#send').disabled=false;
+    if(r.status===401){skel.remove();busy=false;$('#send').disabled=false;
       $('#task').value=task;return;}
     if(!r.ok)throw new Error((await r.json()).detail||('HTTP '+r.status));
     const {run_id}=await r.json();
@@ -784,9 +817,8 @@ $('#btn-tpl')&&($('#btn-tpl').onclick=()=>{
     fd.append('session_id',sid);
     for(const {file,path} of files) fd.append('files',file,path);
     try{
-      const h={}; if(code) h['X-Access-Code']=code;
-      const r=await fetch('/api/upload',{method:'POST',headers:h,body:fd});
-      if(r.status===401){askCode();return;}
+      const r=await api('/api/upload',{method:'POST',body:fd}, true);
+      if(r.status===401){say('访问口令不正确，上传未执行','bad');return;}
       const d=await r.json();
       if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
       say(`已上传 <b>${d.saved}</b> 个文件，索引 ${d.indexed_documents} 文档 / ${d.indexed_chunks} 块`,'good');

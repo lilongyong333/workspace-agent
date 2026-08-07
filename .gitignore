@@ -42,3 +42,10 @@ trace*.jsonl
 !.vscode/extensions.json
 .DS_Store
 Thumbs.db
+
+# -------- 私人材料：绝不入库 --------
+# 提交邮件草稿含姓名/邮箱/收件人，以及私人的私人材料。
+# 这类东西出现在公开仓库里，比没有更糟。
+/docs/提交邮件.md
+/docs/私人*
+/answers/

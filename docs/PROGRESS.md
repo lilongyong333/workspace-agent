@@ -485,15 +485,10 @@ py -3.11 -c "import json;[print(json.loads(l).get('step'), json.loads(l).get('to
    如果线上已经设过 `DEMO_MAX_TOKENS_PER_TASK=80000`，光更新代码不生效，必须改这个变量。
    ⚠️ `QWEN_MODEL` 不填会用内置缺省 `qwen-max` —— 那是**纯文本模型，读不了图**。
 
-2. **发提交邮件**给 `（收件人已脱敏）`，内容含：
-   - 仓库地址 https://github.com/lilongyong333/workspace-agent
-   - 在线 Demo 地址 + 访问口令
-   - 一句话说明：手写循环、无 agent 框架、支持任意文件夹检索
+2. **确认部署成功** —— push 后打开线上页面跑一个示例任务，
+   并确认 `/api/config` 里 `persistent_storage` 为 `true`。
 
-另外两件建议做的：
-
-3. **轮换两把 API key** —— DeepSeek 与通义千问的 key 都在我们的聊天记录里出现过，交付后各换一把。
-4. **确认 Railway 重新部署成功** —— push 后打开线上页面跑一个示例任务。
+3. **定期轮换 API key** —— 尤其是曾经出现在聊天记录、截图或日志里的那些。
 
 ---
 

@@ -153,3 +153,84 @@ def test_readonly_flag_removes_write_tools() -> None:
     ro = {s["function"]["name"] for s in build_tool_schemas(has_index=True, read_only=True)}
     assert {"write_file", "move_file"} <= rw
     assert not ({"write_file", "move_file"} & ro)
+
+
+# ----------------------------------------------------------------------
+# 文件夹上传
+# ----------------------------------------------------------------------
+def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(A, "SESSIONS_DIR", tmp_path / "sessions")
+    store = IndexStore(tmp_path / "idx.db")
+    monkeypatch.setattr(A, "_store", store)
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    c = TestClient(A.app)
+    return c, store
+
+
+def test_upload_saves_folder_and_indexes_it(tmp_path: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """上传完必须立刻可检索 —— 否则用户传完就提问会得到「什么都没有」。"""
+    c, store = _client(tmp_path, monkeypatch)
+    sid = c.post("/api/session").json()["session_id"]
+
+    r = c.post("/api/upload", data={"session_id": sid}, files=[
+        ("files", ("我的资料/预算/2025Q4.md",
+                   "# 2025 Q4 预算\n研发部 1,187,432 元\n".encode(), "text/markdown")),
+        ("files", ("我的资料/合同.csv", b"vendor,amount\nMeridian,55000\n", "text/csv")),
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["saved"] == 2
+    assert body["indexed_documents"] > 0
+
+    assert store.search("1,187,432", limit=3), "上传的内容必须马上能检索到"
+    assert store.search("Meridian", limit=3)
+    store.close()
+
+
+def test_upload_rejects_hostile_paths_instead_of_sanitizing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """恶意路径必须**被拒绝并报告**，不能悄悄清洗后照常保存。
+
+    第一版把 ".." 段过滤掉再拼路径，于是
+    ../../../../etc/cron.d/evil 变成 uploads/etc/cron.d/evil 存了下来，
+    还报告「上传成功」。沙箱边界确实没破，但一次明确的攻击尝试
+    被抹平成了正常上传 —— 用户和日志都看不到它发生过。
+
+    清洗掩盖攻击，拒绝暴露攻击。
+    """
+    c, store = _client(tmp_path, monkeypatch)
+    sid = c.post("/api/session").json()["session_id"]
+
+    hostile = ["../../../../etc/cron.d/evil", "C:/Windows/System32/evil.txt",
+               "/etc/passwd", "a/../../b/evil"]
+    r = c.post("/api/upload", data={"session_id": sid},
+               files=[("files", (p, b"pwned", "text/plain")) for p in hostile]
+                     + [("files", ("ok/正常.md", b"# hi\n", "text/markdown"))])
+    body = r.json()
+
+    assert body["saved"] == 1, "只有那个正常文件该被保存"
+    assert body["skipped_total"] == len(hostile)
+    reasons = " ".join(s["reason"] for s in body["skipped"])
+    assert "拒绝" in reasons
+
+    ws = A.SESSIONS_DIR / sid
+    written = {p.name for p in ws.rglob("*") if p.is_file()}
+    assert "evil" not in written and "evil.txt" not in written and "passwd" not in written
+    store.close()
+
+
+def test_upload_enforces_file_count_limit(tmp_path: Path,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """没有数量闸，一次上传就能把容器磁盘写满或让索引跑到天荒地老。"""
+    c, store = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(A, "MAX_UPLOAD_FILES", 3)
+    sid = c.post("/api/session").json()["session_id"]
+
+    r = c.post("/api/upload", data={"session_id": sid},
+               files=[("files", (f"f{i}.md", b"x", "text/markdown")) for i in range(5)])
+    assert r.status_code == 400
+    store.close()

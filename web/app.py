@@ -44,7 +44,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import (
+    FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile,
+)
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from dotenv import load_dotenv
@@ -360,6 +362,116 @@ async def start_run(
         _runs[run.id] = run
     threading.Thread(target=_execute, args=(run,), daemon=True).start()
     return JSONResponse({"run_id": run.id})
+
+
+def _human(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}GB"
+
+
+UPLOAD_DIR_NAME = "uploads"
+MAX_UPLOAD_FILES = _env_int("DEMO_MAX_UPLOAD_FILES", 400)
+MAX_UPLOAD_TOTAL_BYTES = _env_int("DEMO_MAX_UPLOAD_BYTES", 80 * 1024 * 1024)
+MAX_UPLOAD_FILE_BYTES = _env_int("DEMO_MAX_UPLOAD_FILE_BYTES", 25 * 1024 * 1024)
+
+
+@app.post("/api/upload")
+async def upload_folder(
+    request: Request,
+    session_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+    x_access_code: str | None = Header(None),
+) -> JSONResponse:
+    """整个文件夹上传到会话工作区，并立刻建索引。
+
+    ## 安全要点
+
+    浏览器传上来的 ``webkitRelativePath`` 是**完全不可信的输入** ——
+    攻击者可以随手构造 ``../../../../etc/cron.d/x`` 或
+    ``C:\\Windows\\System32\\x``。所以每一条路径都必须经沙箱 resolve，
+    而不是拿去 ``os.path.join``。这里复用的正是 agent 自己用的那套边界，
+    不另写一份"上传专用"的校验 —— 安全代码只该有一个真相来源。
+
+    另外三道量的闸（文件数 / 单文件 / 总量）是必需的：
+    没有它们，一次上传就能把容器磁盘写满，或让索引任务跑到天荒地老。
+    """
+    require_access(x_access_code)
+    ws = ensure_session(session_id)
+    sb = Sandbox(ws)
+
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(400, f"一次最多上传 {MAX_UPLOAD_FILES} 个文件，收到 {len(files)} 个")
+
+    saved: list[str] = []
+    skipped: list[dict[str, str]] = []
+    total = 0
+
+    for item in files:
+        raw = (item.filename or "").replace("\\", "/").strip()
+        if not raw or raw.endswith("/"):
+            continue
+
+        # **拒绝，而不是清洗。**
+        #
+        # 第一版这里把 ".." 段过滤掉再拼路径，于是
+        # ../../../../etc/cron.d/evil 变成 uploads/etc/cron.d/evil，
+        # 老老实实存下来并报告"上传成功" —— 沙箱边界确实没被突破，
+        # 但一次明确的攻击尝试被悄悄抹平成了正常上传，
+        # 用户与日志都看不到它发生过。
+        #
+        # 安全代码里"看起来没事"和"确实没事"必须区分开：
+        # 清洗掩盖攻击，拒绝暴露攻击。沙箱层一直是这么做的，
+        # 上传这里不该破例。
+        parts = raw.split("/")
+        if any(p == ".." for p in parts):
+            skipped.append({"path": raw, "reason": "路径含 .. ，拒绝（疑似目录穿越）"})
+            continue
+        if raw.startswith("/") or (len(raw) > 1 and raw[1] == ":"):
+            skipped.append({"path": raw, "reason": "绝对路径，拒绝"})
+            continue
+
+        parts = [p for p in parts if p not in ("", ".")]
+        if not parts:
+            skipped.append({"path": raw, "reason": "路径非法"})
+            continue
+
+        rel = f"{UPLOAD_DIR_NAME}/" + "/".join(parts)
+        try:
+            target = sb.resolve(rel)          # ← 越界在这里被拒
+        except SandboxError as exc:
+            skipped.append({"path": raw, "reason": str(exc)})
+            continue
+
+        body = await item.read()
+        if len(body) > MAX_UPLOAD_FILE_BYTES:
+            skipped.append({"path": raw, "reason": f"单文件超过 {_human(MAX_UPLOAD_FILE_BYTES)}"})
+            continue
+        total += len(body)
+        if total > MAX_UPLOAD_TOTAL_BYTES:
+            skipped.append({"path": raw, "reason": f"总量超过 {_human(MAX_UPLOAD_TOTAL_BYTES)}"})
+            break
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+        saved.append(sb.rel(target))
+
+    # 上传完立刻建索引 —— 否则用户传完就提问会得到"什么都没有"
+    store = get_store()
+    root_ids = _ensure_session_indexed(store, session_id, ws)
+    stats = store.corpus_stats(root_ids)
+
+    return JSONResponse({
+        "saved": len(saved),
+        "bytes": total,
+        "skipped": skipped[:20],
+        "skipped_total": len(skipped),
+        "indexed_documents": stats["documents"],
+        "indexed_chunks": stats["chunks"],
+        "parse_failures": stats["parse_failures"][:10],
+    })
 
 
 @app.get("/api/events/{run_id}")

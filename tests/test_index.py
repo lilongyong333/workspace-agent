@@ -282,3 +282,62 @@ def test_corpus_stats_answers_what_is_here(store: IndexStore, corpus: Path) -> N
     assert st["chunks"] > 0
     assert {d["dir"] for d in st["top_directories"]} == {"docs", "data"}
     assert {e["ext"] for e in st["by_extension"]} == {"md", "csv"}
+
+
+# ======================================================================
+# 视觉解析 —— 扫描件与图片
+# ======================================================================
+def test_image_without_vision_says_why_not_silently_skipped(tmp_path: Path,
+                                                            monkeypatch) -> None:
+    """没开视觉时，图片必须**说明原因**，不能当作「不支持的格式」静默跳过。
+
+    静默跳过会让用户以为这个格式永远不行，其实只差一个开关。
+    """
+    monkeypatch.delenv("VISION_OCR", raising=False)
+    f = tmp_path / "扫描件.png"
+    f.write_bytes(bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000100000001080000000"
+        "03a7e9b550000000a49444154789c6360000000020001e221bc3300000"
+        "00049454e44ae426082"))
+    doc = parse(f)
+    assert not doc.ok
+    assert "VISION_OCR" in (doc.error or ""), "报错要指出怎么打开这个能力"
+
+
+def test_vision_refuses_a_text_only_model(monkeypatch) -> None:
+    """配了纯文本模型时必须**直接拒绝**，而不是发出去等一个空回答。
+
+    实测两家的失败方式完全不同：
+        deepseek-v4-flash  收到图像 -> HTTP 400（吵闹的失败，一眼看见）
+        qwen-max           收到图像 -> HTTP 200 +「请提供图片」（静默失败）
+    后者最难排查：不报错，只给一个听起来合理的空答案。
+    所以这里主动校验模型能力，宁可拒绝也不要那个"看起来正常"的结果。
+    """
+    from agent.index.vision import VisionUnavailable, describe_image
+
+    monkeypatch.setenv("VISION_OCR", "1")
+    monkeypatch.setenv("VISION_PROVIDER", "qwen")
+    monkeypatch.setenv("QWEN_API_KEY", "sk-test")
+    monkeypatch.setenv("VISION_MODEL", "qwen-max")     # 纯文本模型
+    with pytest.raises(VisionUnavailable, match="视觉"):
+        describe_image(b"\x89PNG")
+
+
+def test_pdf_without_text_layer_is_reported_not_swallowed(tmp_path: Path,
+                                                          monkeypatch) -> None:
+    """扫描件 PDF 没有文本层时，必须留下可见的警告。
+
+    否则它走完整个索引流程后在库里等于**不存在**，而且不报错 ——
+    用户搜不到只会以为「这份合同没收录」。又一个静默的假阴性。
+    """
+    monkeypatch.delenv("VISION_OCR", raising=False)
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    pdf = tmp_path / "scan.pdf"
+    Image.new("RGB", (300, 200), "white").save(pdf, "PDF")
+
+    doc = parse(pdf)
+    assert not doc.ok
+    text = (doc.error or "") + " ".join(doc.warnings)
+    assert "扫描" in text or "无可抽取文本" in text

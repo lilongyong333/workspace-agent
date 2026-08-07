@@ -259,6 +259,68 @@ def parse_pdf(path: Path) -> ParsedDoc:
         return ParsedDoc(parser="pdf", error=f"{type(exc).__name__}: {exc}")
 
 
+# ----------------------------------------------------------------------
+# 视觉降级 —— 扫描件与图片
+# ----------------------------------------------------------------------
+#
+# 扫描出来的 PDF 没有文本层，图表、印章、手写签名同理。这类文件走完整个
+# 索引流程之后在库里等于**不存在**，而且不报错 —— 用户搜不到，
+# 只会以为"这份合同没收录"。又一个静默的假阴性。
+#
+# 默认关闭：每页一次模型调用，慢且花钱，200 页扫描件能烧掉几十万 token。
+# 有文本层就绝不调模型 —— 文本层又快又准又免费。
+_VISION_MIN_CHARS = 24
+_vision_failed_note: list[str] = []
+
+
+def _vision_on() -> bool:
+    from .vision import vision_enabled
+    return vision_enabled()
+
+
+def _vision_page(doc: Any, pno: int, path: Path) -> str:
+    """把 PDF 的一页渲染成位图交给视觉模型。失败一律降级为空，不炸主流程。"""
+    if not _vision_on():
+        return ""
+    from .vision import MAX_VISION_PAGES, describe_image
+    if pno >= MAX_VISION_PAGES:
+        return ""
+    try:
+        bitmap = doc[pno].render(scale=2)          # 2x 提升小字识别率
+        png = bitmap.to_pil()
+        import io
+        buf = io.BytesIO()
+        png.save(buf, format="PNG")
+        return describe_image(buf.getvalue(), hint=f"{path.name} 第 {pno + 1} 页")
+    except Exception as exc:                        # noqa: BLE001
+        _vision_failed_note.append(f"第 {pno + 1} 页视觉解析失败: {exc}")
+        return ""
+
+
+def parse_image(path: Path) -> ParsedDoc:
+    """图片文件：截图、扫描页、拍照的合同。
+
+    没开视觉解析时**明确说明原因**，而不是当作"不支持的格式"静默跳过 ——
+    后者会让用户以为这个格式永远不行，其实只差一个开关。
+    """
+    if not _vision_on():
+        return ParsedDoc(parser="image",
+                         error="图片需要视觉模型才能检索：设 VISION_OCR=1 并配置 VISION_MODEL")
+    from .vision import describe_image, VisionUnavailable
+    try:
+        text = describe_image(path.read_bytes(), hint=f"图片 {path.name}")
+    except VisionUnavailable as exc:
+        return ParsedDoc(parser="image", error=str(exc))
+    except Exception as exc:                        # noqa: BLE001
+        return ParsedDoc(parser="image", error=f"视觉解析失败: {type(exc).__name__}: {exc}")
+
+    if not text:
+        return ParsedDoc(parser="image", warnings=["图中未识别到文字"])
+    return ParsedDoc(blocks=[TextBlock(text=text, kind="paragraph",
+                                       locator={"via": "vision"})],
+                     title=path.stem, parser="image")
+
+
 def _parse_pdf_pdfium(path: Path) -> ParsedDoc:
     try:
         import pypdfium2 as pdfium
@@ -271,6 +333,7 @@ def _parse_pdf_pdfium(path: Path) -> ParsedDoc:
         blocks: list[TextBlock] = []
         warnings: list[str] = []
         empty = 0
+        vision_used = 0
 
         for pno in range(len(doc)):
             try:
@@ -279,13 +342,26 @@ def _parse_pdf_pdfium(path: Path) -> ParsedDoc:
             except Exception as exc:      # 单页失败不该毁掉整篇
                 warnings.append(f"第 {pno + 1} 页解析失败: {exc}")
                 continue
-            if not text:
+            if len(text) < _VISION_MIN_CHARS:
+                # 没有文本层 —— 可能是扫描页。开启视觉解析时降级去"看"这一页。
+                seen = _vision_page(doc, pno, path)
+                if seen:
+                    blocks.append(TextBlock(text=seen, kind="paragraph",
+                                            locator={"page": pno + 1, "via": "vision"}))
+                    vision_used += 1
+                    continue
                 empty += 1
                 continue
             blocks.append(TextBlock(text=text, kind="paragraph", locator={"page": pno + 1}))
 
+        if vision_used:
+            warnings.append(f"{vision_used} 页无文本层，已用视觉模型转写")
         if empty:
-            warnings.append(f"{empty} 页无可抽取文本（可能是扫描件，需 OCR 才能检索）")
+            warnings.append(
+                f"{empty} 页无可抽取文本"
+                + ("（可能是扫描件；设 VISION_OCR=1 可启用视觉转写）"
+                   if not _vision_on() else "（视觉转写也未得到文字）")
+            )
         if not blocks:
             return ParsedDoc(parser="pdfium", warnings=warnings,
                              error="整份文档无可抽取文本，疑为扫描件")
@@ -413,8 +489,11 @@ def parse_pptx(path: Path) -> ParsedDoc:
 # ----------------------------------------------------------------------
 # 分派
 # ----------------------------------------------------------------------
+IMAGE_EXT = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"}
+
 _DISPATCH: dict[str, Callable[[Path], ParsedDoc]] = {
     "pdf": parse_pdf,
+    **{e: parse_image for e in ("png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff")},
     "docx": parse_docx, "docm": parse_docx,
     "xlsx": parse_xlsx, "xlsm": parse_xlsx,
     "pptx": parse_pptx, "pptm": parse_pptx,
@@ -423,7 +502,7 @@ _DISPATCH: dict[str, Callable[[Path], ParsedDoc]] = {
 # 明确不索引的：二进制、媒体、压缩包、体积巨大的产物
 SKIP_EXT = {
     "exe", "dll", "so", "dylib", "bin", "dat", "db", "sqlite", "pyc", "class", "o", "a",
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico", "tif", "tiff", "psd",
+    "gif", "svg", "ico", "psd",
     "mp3", "mp4", "wav", "avi", "mov", "mkv", "flac", "webm",
     "zip", "tar", "gz", "bz2", "7z", "rar", "xz",
     "woff", "woff2", "ttf", "otf", "eot",

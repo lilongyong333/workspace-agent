@@ -96,7 +96,17 @@ def sync_root(
     store: IndexStore,
     root: Root,
     progress_cb: ProgressCb | None = None,
-    progress_every: int = 50,
+    # 每扫多少个文件回报一次进度。
+    #
+    # 曾经是 50 —— 而一个典型语料就几十个文件，files_seen % 50 == 0
+    # 从来不成立，进度回调**一次都不触发**，界面上永远停在「已扫 0 / 索引 0」，
+    # 看起来像卡死。
+    #
+    # 现在是 1：回调只是更新一个 dict，十万文件也就几十毫秒总开销，
+    # 而"慢文件正在处理哪一个"对用户的价值远大于这点成本 ——
+    # 扫描件一页要调一次视觉模型，几秒起步，没有实时的当前文件名，
+    # 用户无法区分"在干活"和"挂了"。
+    progress_every: int = 1,
 ) -> IndexProgress:
     """增量同步一个根目录。"""
     root_path = Path(root.path)
@@ -116,7 +126,9 @@ def sync_root(
             seen_rel.add(rel)
             prog.current = rel
 
-            if progress_cb and prog.files_seen % progress_every == 0:
+            # 第一个文件就报一次，别让界面在开头空等一拍
+            if progress_cb and (prog.files_seen == 1
+                                or prog.files_seen % progress_every == 0):
                 progress_cb(prog)
 
             try:

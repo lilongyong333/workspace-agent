@@ -212,16 +212,33 @@ def _drop_session_index(session_id: str) -> None:
         log.exception("清理会话索引失败: %s", session_id)
 
 
-def _ensure_session_indexed(store: Any, session_id: str, ws: Path) -> list[int]:
+def _ensure_session_indexed(store: Any, session_id: str, ws: Path,
+                            note: Any = None) -> list[int]:
     """把会话工作区注册进索引并增量同步，返回本次检索可用的 root id 列表。
 
     同时带上用户自己注册的目录 —— 那是「索引我的文件夹」这个功能的入口。
+
+    **已有后台任务在跑时，绝不再起一个同步。**
+    上传后台建索引（扫描件逐页调视觉模型，几十秒）期间用户完全可能直接提问，
+    此时再同步跑一次 sync_root，两个作业会抢同一个串行化的 sqlite 连接 ——
+    结果不是崩，而是 agent 干等几十秒，界面上只有一个"运行中…"，
+    看起来像整个系统卡死了。
+
+    正确做法是用现有索引先答，并**把这件事说出来**：
+    "正在后台建索引" 是有用信息，静默等待不是。
     """
     label = SESSION_ROOT_PREFIX + session_id
     root = store.get_root(label=label)
     if root is None:
         root = store.add_root(str(ws), label=label)
-    sync_root(store, root)
+
+    if _index_jobs.get(root.id, {}).get("status") == "scanning":
+        if note:
+            p = _index_jobs[root.id].get("progress") or {}
+            note(f"索引正在后台构建（已扫 {p.get('files_seen', 0)} 个文件），"
+                 f"本次先用已建好的部分作答")
+    else:
+        sync_root(store, root)
 
     others = [r.id for r in store.list_roots()
               if r.id != root.id and not r.label.startswith(SESSION_ROOT_PREFIX)]
@@ -273,7 +290,10 @@ def _execute(run: Run) -> None:
         # 成本：32 个文件约 0.5 秒，且增量同步在无变更时是毫秒级。
         # 必须每次跑之前同步 —— 上一次任务可能改过工作区，
         # 陈旧索引会让模型引用到已经不存在的内容。
-        root_ids = _ensure_session_indexed(store, run.session_id, ws)
+        root_ids = _ensure_session_indexed(
+            store, run.session_id, ws,
+            note=lambda msg: run.events.put({"type": "note", "message": msg}),
+        )
         runner = AgentRunner(
             ws,
             llm=LLMClient(run.llm_config),

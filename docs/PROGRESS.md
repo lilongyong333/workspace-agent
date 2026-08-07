@@ -17,10 +17,10 @@
 | 离线测试 | **112 / 112 通过**（约 9 秒） |
 | 端到端测试 | 5 项，需 `--live` 与真实 API key |
 | 在线 Demo | **https://agent.llynb.cc** （自定义域已生效，证书有效；Railway 原域名仍可用作备份） |
-| GitHub 仓库 | https://github.com/lilongyong333/workspace-agent （**目前 PRIVATE，交付前必须转 Public**） |
-| 代码量 | agent 核心 ~2,100 行 + 检索子系统 1,593 行 + 测试 1,300 行 + 前端 34KB |
+| GitHub 仓库 | https://github.com/lilongyong333/workspace-agent （已 Public ✅） |
+| 代码量 | agent 核心 2,351 行（含 index 子系统 1,855）+ web 683 + 测试 1,881 + 前端 50KB |
 
-**交付前还剩两件事必须你自己做**：仓库转 Public、发提交邮件。见 §7。
+**交付前还剩两件事必须你自己做**：Railway 配环境变量、发提交邮件。见 §7。
 
 ---
 
@@ -93,7 +93,7 @@ python agent.py ask --label ... --task "..." --out 回答.md
 
 ---
 
-### 1.6 第二轮：由你的实测反馈驱动的五件事
+### 1.6 第二轮：由你的实测反馈驱动的六件事
 
 前面 1.1–1.5 是我按计划做的。下面这些是**你在 Web 上真跑之后暴露出来的**，
 每一件都对应一个具体的失败截图或一句「这个跑不完」。
@@ -105,7 +105,7 @@ python agent.py ask --label ... --task "..." --out 回答.md
 | **模型选择器** | 「能不能像 Claude Code 那样切模型」 | `/api/config` 只列服务端已配 key 的 provider |
 | **语音输入** | 「加个语音转文字按钮」 | 浏览器原生 Web Speech API，零额外依赖 |
 | **视觉解析** | 「PDF 和图文解析也要能处理」 | 无文本层的页渲染成位图交给 `qwen-vl-max` |
-| **Web 只读开关** | 你按我给的测试用例第 7 条测出「有 bug」 | 见下方 §4.9 —— 那不是 bug，是我用例写歪了，但它暴露了真问题 |
+| **Web 只读开关** | 你按我给的测试用例第 7 条测出「有 bug」 | 见下方 §4.11 —— 那不是 bug，是我用例写歪了，但它暴露了真问题 |
 
 ---
 

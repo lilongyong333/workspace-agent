@@ -70,7 +70,20 @@ log = logging.getLogger("workspace-agent.web")
 
 ROOT = Path(__file__).resolve().parents[1]
 SEED_DIR = ROOT / "workspace_seed"
-SESSIONS_DIR = ROOT / "sessions"
+
+# 运行期数据（会话工作区 + 索引库）的落点。
+#
+# 默认写在代码目录旁边，本地开发最省事。但**托管平台的容器文件系统是临时的**：
+# 每次重新部署、每次重启，这些数据都会消失。
+# 实际发生过的情况：用户传完 7 个文件正在测试，我推了一次修复触发重新部署，
+# 他的上传和索引一起没了 —— 而界面上只表现为"什么都搜不到"，
+# 很容易被误判成检索坏了。
+#
+# 设成环境变量，就能把 Railway Volume 挂到这里实现持久化：
+#     DATA_DIR=/data   （并在 Railway 把 Volume 挂载到 /data）
+DATA_DIR = Path(os.getenv("DATA_DIR") or ROOT).resolve()
+SESSIONS_DIR = DATA_DIR / "sessions"
+INDEX_DB = DATA_DIR / ".index" / "index.db"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="Workspace Agent", version="0.2.0")
@@ -154,6 +167,10 @@ class Guard:
                 # 可选模型列表 —— 只列服务端**已配置 key** 的 provider。
                 # 前端据此渲染模型选择器；key 本身永不出现在响应里。
                 "models": available_providers(),
+                # 数据是否会在重启后保留。没挂持久卷时必须**明说**：
+                # 用户传完文件、服务一重启就全没了，界面上只表现为
+                # "什么都搜不到"，极易被误判成检索坏了。
+                "persistent_storage": DATA_DIR != ROOT,
             }
 
 
@@ -586,7 +603,7 @@ def get_store() -> Any:
     with _store_lock:
         if _store is None:
             from agent.index.store import IndexStore
-            _store = IndexStore(ROOT / ".index" / "index.db")
+            _store = IndexStore(INDEX_DB)
     return _store
 
 

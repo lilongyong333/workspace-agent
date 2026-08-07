@@ -425,6 +425,10 @@ textarea::placeholder{color:var(--text-3)}
           </span>
           <span class="fine">上传后自动建索引，随即可提问。<br>
             支持 pdf / docx / xlsx / pptx / csv / md / 代码；扫描件与图片需开启视觉解析</span>
+          <div class="fine" id="persist-warn" hidden style="color:var(--warn)">
+            ⚠️ 本实例未挂持久卷：<b>服务重启或重新部署后，上传的文件与索引会被清空</b>。
+            演示前请现场上传一次。
+          </div>
           <div class="up-bar" id="up-bar" hidden><i></i></div>
           <div class="up-log" id="up-log" hidden></div>
         </div>
@@ -736,7 +740,10 @@ $('#btn-reset').onclick=async()=>{
 (async()=>{
   await initSession();
   try{const c=await (await fetch('/api/config')).json();
-    $('#model').textContent=c.model; buildModelMenu(c.models||[]);}catch{}
+    $('#model').textContent=c.model; buildModelMenu(c.models||[]);
+    // 数据会不会丢，必须在用户上传**之前**就看到，而不是文件没了才发现
+    if(c.persistent_storage===false) $('#persist-warn').hidden=false;
+  }catch{}
   loadRoots();
 })();
 

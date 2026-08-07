@@ -47,8 +47,19 @@ from typing import Any, Iterator
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from agent.index.indexer import sync_root
-from agent.llm import LLMClient, LLMError
+from dotenv import load_dotenv
+
+# 必须在导入 agent.* 之前加载 —— 那些模块在读环境变量。
+#
+# 这里曾经缺失，导致 README 里写的本地启动流程实际是坏的：
+#   cp .env.example .env && uvicorn web.app:app --reload
+# .env 从头到尾没人读，跑任务时报「缺少 LLM_API_KEY」。
+# 线上一直没暴露，是因为 Railway 注入的是真实环境变量，不走 .env。
+# 典型的「部署环境掩盖了开发环境的 bug」。
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+from agent.index.indexer import sync_root                          # noqa: E402
+from agent.llm import LLMClient, LLMConfig, LLMError, available_providers  # noqa: E402
 from agent.loop import AgentRunner
 from agent.sandbox import Sandbox, SandboxError
 from agent.trace import TraceRecorder
@@ -138,6 +149,9 @@ class Guard:
                 "rate_limit_per_hour": RATE_LIMIT_PER_HOUR,
                 "max_tokens_per_task": MAX_TOKENS_PER_TASK,
                 "access_code_required": bool(ACCESS_CODE),
+                # 可选模型列表 —— 只列服务端**已配置 key** 的 provider。
+                # 前端据此渲染模型选择器；key 本身永不出现在响应里。
+                "models": available_providers(),
             }
 
 
@@ -220,6 +234,12 @@ class Run:
     id: str
     session_id: str
     task: str
+    # None 表示用服务端默认模型
+    llm_config: Any = None
+    # 只读模式：不向模型暴露 write_file / move_file。
+    # 这条能力原本只有 CLI 的 ask 有，Web 上演示不了 ——
+    # 而它恰恰是最能说明设计取向的一条（边界靠能力不存在，不靠提示词）。
+    read_only: bool = False
     events: queue.Queue = field(default_factory=queue.Queue)
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -254,11 +274,12 @@ def _execute(run: Run) -> None:
         root_ids = _ensure_session_indexed(store, run.session_id, ws)
         runner = AgentRunner(
             ws,
-            llm=LLMClient(),
+            llm=LLMClient(run.llm_config),
             trace=trace,
             token_budget=MAX_TOKENS_PER_TASK,
             store=store,
             root_ids=root_ids,
+            read_only=run.read_only,
         )
         result = runner.run(run.task)
         guard.add_tokens(result.usage.get("total_tokens", 0))
@@ -315,7 +336,26 @@ async def start_run(
     session_id = str(payload.get("session_id") or "")
     ensure_session(session_id)
 
-    run = Run(id=str(uuid.uuid4()), session_id=session_id, task=task)
+    # 模型选择：**只认服务端已配置 key 的 provider**。
+    # 绝不接受前端传 base_url 或 api_key —— 否则一个请求就能让服务器
+    # 拿着你的 key 去打任意端点，或者把任意端点的响应当成模型输出。
+    llm_config = None
+    want = str(payload.get("provider") or "").strip().lower()
+    if want:
+        allowed = {m["provider"]: m for m in available_providers()}
+        if want not in allowed:
+            raise HTTPException(400, f"provider {want!r} 未在服务端配置 API key")
+        # 模型名同样只在该 provider 的白名单内取值，不接受任意字符串
+        model = str(payload.get("model") or "").strip() or allowed[want]["model"]
+        if model != allowed[want]["model"]:
+            raise HTTPException(400, f"模型 {model!r} 不在该 provider 的可选项内")
+        try:
+            llm_config = LLMConfig.for_provider(want, model)
+        except LLMError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    run = Run(id=str(uuid.uuid4()), session_id=session_id, task=task,
+              llm_config=llm_config, read_only=bool(payload.get("read_only")))
     with _runs_lock:
         _runs[run.id] = run
     threading.Thread(target=_execute, args=(run,), daemon=True).start()

@@ -45,6 +45,60 @@ _PROVIDERS: dict[str, tuple[str, Wire]] = {
     "dashscope": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "openai"),
 }
 
+# 每家的缺省模型。可用 {PROVIDER}_MODEL 环境变量覆盖。
+DEFAULT_MODELS: dict[str, str] = {
+    "deepseek": "deepseek-v4-flash",
+    "openai": "gpt-4o",
+    "zhipu": "glm-4-plus",
+    "moonshot": "moonshot-v1-32k",
+    "gemini": "gemini-2.0-flash",
+    "anthropic": "claude-sonnet-5",
+    "qwen": "qwen-max",
+    "dashscope": "qwen-max",
+}
+
+# 具备视觉能力的模型前缀。
+#
+# 这不是装饰性元数据：实测 deepseek 的接口**直接拒绝图像输入**
+#   HTTP 400  unknown variant `image_url`, expected `text`
+# 所以「扫描件 PDF / 图表解析」这类需求，必须先切到带视觉的模型。
+# 前端据此在模型选择器里标出哪些能处理图像，避免用户选了个纯文本模型
+# 再去困惑为什么图片读不出来。
+VISION_MODEL_PREFIXES = ("qwen-vl", "qwen2-vl", "gpt-4o", "gemini", "claude-", "glm-4v")
+
+
+def model_supports_vision(model: str) -> bool:
+    m = (model or "").lower()
+    return any(m.startswith(p) for p in VISION_MODEL_PREFIXES)
+
+
+def available_providers() -> list[dict[str, Any]]:
+    """列出**服务端已配置 key** 的 provider，供前端做模型选择器。
+
+    只暴露名字与缺省模型，绝不外泄 key 本身。
+    """
+    default_provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
+    out: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for name, (url, _wire) in _PROVIDERS.items():
+        has_key = bool(os.getenv(f"{name.upper()}_API_KEY", "").strip())
+        if not has_key and name == default_provider:
+            has_key = bool(os.getenv("LLM_API_KEY", "").strip())
+        if not has_key or url in seen_urls:      # dashscope 与 qwen 同址，只列一个
+            continue
+        seen_urls.add(url)
+        model = (os.getenv(f"{name.upper()}_MODEL")
+                 or (os.getenv("LLM_MODEL") if name == default_provider else None)
+                 or DEFAULT_MODELS.get(name, ""))
+        out.append({
+            "provider": name,
+            "model": model,
+            "vision": model_supports_vision(model),
+            "is_default": name == default_provider,
+        })
+    return out
+
 
 class LLMError(RuntimeError):
     """模型调用失败且已耗尽重试。由 loop 转成 FAILED 终止。"""
@@ -109,6 +163,39 @@ class LLMConfig:
     wire: Wire
     timeout_seconds: float = 120.0
     max_retries: int = 3
+
+    @classmethod
+    def for_provider(cls, provider: str, model: str | None = None) -> "LLMConfig":
+        """按 provider 名字装配配置，用于运行期切换模型。
+
+        key 的来源顺序：``{PROVIDER}_API_KEY`` → 默认 ``LLM_API_KEY``（仅当它
+        就是默认 provider 时）。**key 永远只从服务端环境变量读**，
+        绝不接受调用方传入 —— 否则前端一个请求就能让服务器拿任意 key 去打任意端点。
+        """
+        provider = (provider or "").strip().lower()
+        default_url, wire = _PROVIDERS.get(provider, ("", ""))
+        if not default_url:
+            raise LLMError(f"未知 provider {provider!r}")
+
+        key = os.getenv(f"{provider.upper()}_API_KEY", "").strip()
+        if not key and provider == os.getenv("LLM_PROVIDER", "deepseek").strip().lower():
+            key = os.getenv("LLM_API_KEY", "").strip()
+        if not key:
+            raise LLMError(
+                f"{provider} 未配置 API key。请设置环境变量 {provider.upper()}_API_KEY。"
+            )
+
+        return cls(
+            provider=provider,
+            api_key=key,
+            model=(model or os.getenv(f"{provider.upper()}_MODEL")
+                   or DEFAULT_MODELS.get(provider, "")),
+            base_url=(os.getenv("LLM_BASE_URL") if provider == os.getenv("LLM_PROVIDER", "")
+                      else None) or default_url,
+            wire=wire,
+            timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
+            max_retries=int(os.getenv("LLM_MAX_RETRIES", "3")),
+        )
 
     @classmethod
     def from_env(cls) -> "LLMConfig":

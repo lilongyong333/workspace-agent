@@ -91,3 +91,65 @@ def test_sessions_do_not_see_each_others_workspaces(isolated: IndexStore) -> Non
     b_hits = {h.rel_path for h in isolated.search("alphamark7", limit=5, root_ids=ids_b)}
     assert not a_hits, "会话 A 不该看到会话 B 的文件"
     assert not b_hits, "会话 B 不该看到会话 A 的文件"
+
+
+# ----------------------------------------------------------------------
+# 模型选择：只认服务端已配置 key 的 provider
+# ----------------------------------------------------------------------
+def test_run_rejects_unconfigured_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """前端不能指定一个服务端没配 key 的 provider。"""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    c = TestClient(A.app)
+    sid = c.post("/api/session").json()["session_id"]
+
+    r = c.post("/api/run", json={"task": "x", "session_id": sid, "provider": "openai"})
+    assert r.status_code == 400 and "未在服务端配置" in r.json()["detail"]
+
+
+def test_run_rejects_arbitrary_model_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """模型名也必须在白名单内。
+
+    否则前端可以传任意字符串当模型名，让服务器拿你的 key 去打一个
+    你从未打算调用的模型 —— 计费和内容都不受控。
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    c = TestClient(A.app)
+    sid = c.post("/api/session").json()["session_id"]
+
+    r = c.post("/api/run", json={"task": "x", "session_id": sid,
+                                 "provider": "deepseek", "model": "evil-model"})
+    assert r.status_code == 400
+
+
+def test_config_never_leaks_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """模型列表是公开端点 —— 里面绝不能出现 key 的任何片段。"""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-super-secret-value-42")
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    c = TestClient(A.app)
+
+    raw = c.get("/api/config").text
+    assert "sk-super-secret" not in raw
+    assert "super-secret-value" not in raw
+
+
+def test_readonly_flag_removes_write_tools() -> None:
+    """Web 端的只读开关必须真的把写工具从工具清单里拿掉。
+
+    这条能力原本只有 CLI 的 ask 有，Web 上演示不了 ——
+    而它恰恰是最能说明设计取向的一条：边界靠能力不存在，不靠提示词。
+    """
+    from agent.tools import build_tool_schemas
+
+    rw = {s["function"]["name"] for s in build_tool_schemas(has_index=True)}
+    ro = {s["function"]["name"] for s in build_tool_schemas(has_index=True, read_only=True)}
+    assert {"write_file", "move_file"} <= rw
+    assert not ({"write_file", "move_file"} & ro)

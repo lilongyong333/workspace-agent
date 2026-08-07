@@ -182,7 +182,42 @@ textarea::placeholder{color:var(--text-3)}
 .send:active:not(:disabled){transform:translateY(0) scale(.97)}
 .send:disabled{opacity:.35;cursor:not-allowed}
 .hint{margin-top:var(--sp-2);font:var(--fs-xs)/1 var(--mono);color:var(--text-3);
-      display:flex;gap:var(--sp-3);align-items:center}
+      display:flex;gap:var(--sp-3);align-items:center;flex-wrap:wrap}
+.hint .sep{opacity:.4}
+
+/* 语音输入 —— 走浏览器原生 Web Speech API，不额外依赖任何 ASR 服务 */
+.mic{flex:none;display:grid;place-items:center;width:32px;height:32px;border-radius:var(--r-md);
+     color:var(--text-3);transition:var(--d-fast) var(--ease-out)}
+.mic:hover:not(:disabled){background:var(--bg-hover);color:var(--text-1)}
+.mic:disabled{opacity:.3;cursor:not-allowed}
+.mic.rec{color:var(--on-accent);background:var(--danger,#c0392b)}
+.mic.rec svg{animation:pulse 1.2s var(--ease-out) infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.mic.rec svg{animation:none}}
+
+/* 只读开关 */
+.ro{display:inline-flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
+.ro input{accent-color:var(--accent);width:13px;height:13px;cursor:pointer}
+.ro:hover{color:var(--text-2)}
+
+/* 模型选择器 */
+.model-pick{position:relative}
+.tag-btn{cursor:pointer;transition:var(--d-fast) var(--ease-out)}
+.tag-btn:hover{color:var(--text-1);border-color:var(--accent)}
+.tag-btn::after{content:"⌄";margin-left:5px;opacity:.6}
+.menu{position:absolute;top:calc(100% + 6px);left:0;z-index:60;min-width:230px;
+      background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--r-md);
+      box-shadow:0 10px 34px rgb(0 0 0/.24);padding:4px;display:flex;flex-direction:column;gap:2px}
+.menu button{display:flex;align-items:center;gap:var(--sp-2);width:100%;text-align:left;
+             padding:7px 9px;border-radius:var(--r-sm);font-size:var(--fs-sm);cursor:pointer}
+.menu button:hover,.menu button:focus-visible{background:var(--bg-hover)}
+.menu button[aria-selected="true"]{color:var(--accent)}
+.menu .mm{font:var(--fs-xs)/1 var(--mono);color:var(--text-3)}
+.menu .vis{font:var(--fs-xs)/1 var(--mono);padding:2px 5px;border-radius:var(--r-sm);
+           border:1px solid currentColor;margin-left:auto;flex:none}
+.menu .vis.no{color:var(--text-3)}
+.menu .vis.yes{color:var(--accent)}
+.menu .empty{padding:9px;color:var(--text-3);font-size:var(--fs-xs);line-height:1.6}
 
 /* ── 右栏 ───────────────────────────────────────────────── */
 .aside{border-left:1px solid var(--border);background:var(--bg-surface);
@@ -257,7 +292,10 @@ textarea::placeholder{color:var(--text-3)}
 <div class="app">
   <header class="top">
     <div class="logo"><span class="pip"></span>Workspace Agent</div>
-    <span class="tag" id="model">—</span>
+    <div class="model-pick">
+      <button class="tag tag-btn" id="model" aria-haspopup="listbox" aria-expanded="false">—</button>
+      <div class="menu" id="model-menu" role="listbox" hidden></div>
+    </div>
     <div class="grow"></div>
     <div class="metrics">
       <span>调用 <b id="m-calls">0</b></span>
@@ -288,11 +326,23 @@ textarea::placeholder{color:var(--text-3)}
       <div class="composer">
         <div class="box">
           <textarea id="task" rows="1" placeholder="描述你要它做的事…"></textarea>
+          <button class="mic" id="mic" title="语音输入" aria-label="语音输入">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/>
+              <path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/>
+            </svg>
+          </button>
           <button class="send" id="send">运行</button>
         </div>
         <div class="hint" id="hint">
-          <span>同一个循环 · 无任务专用分支 · 无删除能力</span>
+          <span id="status">同一个循环 · 无任务专用分支 · 无删除能力</span>
+          <span class="sep">·</span>
+          <label class="ro" title="只向模型暴露只读工具：write_file / move_file 根本不进工具清单">
+            <input type="checkbox" id="readonly"><span>只读模式</span>
+          </label>
           <span class="grow"></span>
+          <span id="mic-hint"></span>
           <span><span class="kbd">⌘K</span> 搜索</span>
           <span><span class="kbd">↵</span> 发送</span>
         </div>
@@ -545,7 +595,7 @@ function render(ev){
 async function run(){
   const task=$('#task').value.trim(); if(!task||busy)return;
   busy=true;$('#send').disabled=true;
-  $('#hint').firstElementChild.innerHTML='<span class="caret"></span> 运行中…';
+  $('#status').innerHTML='<span class="caret"></span> 运行中…';
   add(`<div class="gut">›</div><div class="cell usr">${esc(task)}</div>`);
   $('#task').value='';$('#task').style.height='auto';
   const skel=add(`<div class="gut"></div><div class="cell">
@@ -554,7 +604,10 @@ async function run(){
 
   try{
     const r=await fetch('/api/run',{method:'POST',headers:hdrs(),
-      body:JSON.stringify({task,session_id:sid,access_code:code})});
+      body:JSON.stringify({task,session_id:sid,access_code:code,
+        provider:picked?picked.provider:undefined,
+        model:picked?picked.model:undefined,
+        read_only:$('#readonly').checked})});
     if(r.status===401){skel.remove();askCode();busy=false;$('#send').disabled=false;
       $('#task').value=task;return;}
     if(!r.ok)throw new Error((await r.json()).detail||('HTTP '+r.status));
@@ -567,7 +620,7 @@ async function run(){
       es.onerror=()=>{es.close();res();};});
   }catch(err){skel.remove();render({type:'error',message:String(err.message||err)});}
   finally{busy=false;$('#send').disabled=false;
-    $('#hint').firstElementChild.textContent='同一个循环 · 无任务专用分支 · 无删除能力';}
+    $('#status').textContent='同一个循环 · 无任务专用分支 · 无删除能力';}
 }
 
 /* ── 绑定 ── */
@@ -591,8 +644,89 @@ $('#btn-reset').onclick=async()=>{
 (async()=>{
   await initSession();
   try{const c=await (await fetch('/api/config')).json();
-    $('#model').textContent=c.model;}catch{}
+    $('#model').textContent=c.model; buildModelMenu(c.models||[]);}catch{}
   loadRoots();
+})();
+
+/* ── 模型选择器 ───────────────────────────────────────────
+   只渲染 /api/config 给出的列表 —— 那是服务端**已配置 key** 的 provider。
+   前端不持有也不传递任何 key。                                          */
+let picked=null;
+function buildModelMenu(models){
+  const menu=$('#model-menu'), btn=$('#model');
+  if(!models.length){
+    menu.innerHTML='<div class="empty">服务端只配置了一个模型。<br>'+
+      '增加可选项：在部署环境加 <code>QWEN_API_KEY</code> 等变量。</div>';
+  }else{
+    picked=models.find(m=>m.is_default)||models[0];
+    btn.textContent=picked.model;
+    menu.innerHTML=models.map((m,i)=>
+      `<button role="option" data-i="${i}" aria-selected="${m===picked}">
+         <span>${esc(m.provider)}<span class="mm"> ${esc(m.model)}</span></span>
+         <span class="vis ${m.vision?'yes':'no'}">${m.vision?'图像':'纯文本'}</span>
+       </button>`).join('');
+    menu.querySelectorAll('button').forEach(b=>b.onclick=()=>{
+      picked=models[+b.dataset.i];
+      btn.textContent=picked.model;
+      menu.querySelectorAll('button').forEach(x=>
+        x.setAttribute('aria-selected', x===b));
+      closeMenu();
+    });
+  }
+  const openMenu =()=>{menu.hidden=false;btn.setAttribute('aria-expanded','true');};
+  const closeMenu=()=>{menu.hidden=true; btn.setAttribute('aria-expanded','false');};
+  btn.onclick=e=>{e.stopPropagation();menu.hidden?openMenu():closeMenu();};
+  document.addEventListener('click',closeMenu);
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeMenu();});
+}
+
+/* ── 语音输入 ─────────────────────────────────────────────
+   用浏览器原生 Web Speech API，不引入任何 ASR 服务：
+   零额外 key、零费用、零后端改动。代价是只有 Chrome / Edge 支持，
+   所以必须优雅降级 —— 不支持时把按钮禁用并说明原因，
+   而不是让用户点了没反应。                                            */
+(function(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  const mic=$('#mic'), ta=$('#task'), tip=$('#mic-hint');
+  if(!SR){
+    mic.disabled=true;
+    mic.title='当前浏览器不支持语音识别，请用 Chrome 或 Edge';
+    tip.textContent='语音需 Chrome/Edge';
+    return;
+  }
+  const rec=new SR();
+  rec.lang='zh-CN'; rec.continuous=true; rec.interimResults=true;
+  let on=false, base='';
+
+  rec.onresult=e=>{
+    let done='',live='';
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const t=e.results[i][0].transcript;
+      if(e.results[i].isFinal) done+=t; else live+=t;
+    }
+    if(done) base=(base+done).trim();
+    ta.value=(base+(live?' '+live:'')).trim();
+    ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,180)+'px';
+  };
+  rec.onerror=e=>{
+    tip.textContent = e.error==='not-allowed' ? '麦克风权限被拒绝' : '语音识别出错：'+e.error;
+    stop();
+  };
+  rec.onend=()=>{ if(on) stop(); };   // 静音超时会自动结束，同步一下按钮状态
+
+  function start(){
+    base=ta.value.trim(); on=true;
+    mic.classList.add('rec'); mic.title='停止录音';
+    tip.textContent='正在听…';
+    try{ rec.start(); }catch{}
+  }
+  function stop(){
+    on=false; mic.classList.remove('rec'); mic.title='语音输入';
+    if(tip.textContent==='正在听…') tip.textContent='';
+    try{ rec.stop(); }catch{}
+    ta.focus();
+  }
+  mic.onclick=()=>on?stop():start();
 })();
 </script>
 </body>

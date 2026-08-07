@@ -16,7 +16,7 @@
 |---|---|
 | 离线测试 | **93 / 93 通过**（约 3 秒） |
 | 端到端测试 | 5 项，需 `--live` 与真实 API key |
-| 在线 Demo | https://workspace-agent-production-50c8.up.railway.app （**代码已更新，需重新部署才生效**） |
+| 在线 Demo | **https://agent.llynb.cc** （自定义域已生效，证书有效；Railway 原域名仍可用作备份） |
 | GitHub 仓库 | https://github.com/lilongyong333/workspace-agent （**目前 PRIVATE，交付前必须转 Public**） |
 | 代码量 | agent 核心 ~2,100 行 + 检索子系统 1,593 行 + 测试 1,300 行 + 前端 34KB |
 
@@ -332,7 +332,7 @@ py -3.11 -c "import json;[print(json.loads(l).get('step'), json.loads(l).get('to
 
 | 问题 | 说明 | 怎么办 |
 |---|---|---|
-| **线上还是旧代码** | 这一轮的改动都在本地，Railway 上跑的是上一次部署的版本 | push 之后 Railway 会自动重新构建；部署完自己开一次页面确认 |
+| **自定义域走了 Cloudflare 代理** | `agent.llynb.cc` 的响应头带 `CF-RAY` / `Server: cloudflare`，而 Railway 原域名是 `Server: railway-hikari` —— 说明流量经过 CF 代理层。代码里的 `X-Accel-Buffering: no` 是 nginx 指令，**Cloudflare 不认** | 演示前跑一个任务，确认 trace 是**逐步刷出**而不是转很久后一次性出现。若被缓冲，把 Cloudflare 该记录改成灰云（DNS only）即可绕开 |
 | **Railway 文件系统是临时的** | 容器重启/重新部署后 `.index/index.db` **会丢**，需要重新 sync | 演示前现场 sync 一次即可（种子语料只要 0.44s）；要持久化得挂 Railway Volume |
 | **Web 端注册的是「服务器上的路径」** | 远程用户在网页里填 `D:/公司资料` 一定失败 —— 那是**你**电脑上的路径，服务器看不到 | 线上演示只注册容器内路径（如 `workspace_seed`）；「索引我自己的文件夹」这个能力请用本地 CLI 演示 |
 | 无文件上传 | 网页上没法把本地文件传上去建索引 | 属于下一步功能，不是 bug |

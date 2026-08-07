@@ -14,7 +14,7 @@
 
 | 项目 | 状态 |
 |---|---|
-| 离线测试 | **93 / 93 通过**（约 3 秒） |
+| 离线测试 | **112 / 112 通过**（约 9 秒） |
 | 端到端测试 | 5 项，需 `--live` 与真实 API key |
 | 在线 Demo | **https://agent.llynb.cc** （自定义域已生效，证书有效；Railway 原域名仍可用作备份） |
 | GitHub 仓库 | https://github.com/lilongyong333/workspace-agent （**目前 PRIVATE，交付前必须转 Public**） |
@@ -90,6 +90,22 @@ python agent.py ask --label ... --task "..." --out 回答.md
 新增 `tests/test_index.py`（284 行，20 项），覆盖四件事：
 **建得对、增量快、检索准、陈旧能识别**。最后一条最关键 ——
 没有它，索引就是在制造错误答案。
+
+---
+
+### 1.6 第二轮：由你的实测反馈驱动的五件事
+
+前面 1.1–1.5 是我按计划做的。下面这些是**你在 Web 上真跑之后暴露出来的**，
+每一件都对应一个具体的失败截图或一句「这个跑不完」。
+
+| 能力 | 由什么触发 | 关键实现 |
+|---|---|---|
+| **语料提纲** | 一句「总结主要内容」烧掉 40K~54K tokens 撞上限 | `IndexStore.outline()` 逐文件给标题+小标题+首段预览 |
+| **文件夹上传** | 「能不能直接在界面里上传整个文件夹」 | `POST /api/upload`，路径全部过沙箱，上传完即建索引 |
+| **模型选择器** | 「能不能像 Claude Code 那样切模型」 | `/api/config` 只列服务端已配 key 的 provider |
+| **语音输入** | 「加个语音转文字按钮」 | 浏览器原生 Web Speech API，零额外依赖 |
+| **视觉解析** | 「PDF 和图文解析也要能处理」 | 无文本层的页渲染成位图交给 `qwen-vl-max` |
+| **Web 只读开关** | 你按我给的测试用例第 7 条测出「有 bug」 | 见下方 §4.9 —— 那不是 bug，是我用例写歪了，但它暴露了真问题 |
 
 ---
 
@@ -229,7 +245,71 @@ token 边界对上了），于是兜底不再触发，**另外 3 个被永久漏
 > `workspace-agent/answers/`（没有删除，只是挪走）。
 > 那个文件夹是你要交作业的地方，不该留 AI 生成的残留文件。
 
-### 4.5 之前几轮的（已在早前提交中修复，列此备查）
+### 4.6 报错是死胡同，逼得模型连猜三次
+
+你截图里：模型读完 `meetings/`（文件名全是 `2026-01-07-team-retro.md` 这种日期前缀）后，
+**把这套命名规范跨目录套用到 `notes/`**，连编三个不存在的文件名，一个回合三次调用全废。
+
+根因不在模型犯傻，在于 `不是文件或不存在` 这条错误**毫无信息量** ——
+模型拿到它除了再猜一次别无他法。
+
+**修复**：报错带上同级目录的真实内容 + `difflib` 最接近候选。
+第一次失败就够自我纠正，不会有第二第三次。
+`test_missing_file_error_lists_actual_siblings` 等 5 条锁死。
+
+### 4.7 语料概览只有形状，没有内容
+
+`describe_corpus` 返回文件数、字节数、扩展名分布 —— **没有一个字是内容**。
+而你问的是「按目录和文件类型总结**主要内容**」，统计只答了前半句。
+
+值得记的一点：那个工具的描述里**早就写了「不要逐个 read_file」，模型照样读了 32 个**。
+又一次印证：提示词是哀求，接口才是约束。
+
+**修复**：`outline()` 补上逐文件提纲。46,882 → 8,307 tokens，`read_file` 32 次 → 0 次。
+
+### 4.8 上传把恶意路径「清洗」后照常保存
+
+第一版把路径里的 `..` 过滤掉再拼接，于是 `../../../../etc/cron.d/evil`
+变成 `uploads/etc/cron.d/evil` 老老实实存下来，并报告「上传成功」。
+
+实测确认**沙箱边界没有被突破**（没有任何文件落到沙箱外）。但问题在于：
+一次明确的攻击尝试被悄悄抹平成了正常上传，用户和日志都看不见它发生过。
+
+**清洗掩盖攻击，拒绝暴露攻击。** 沙箱层一直是这个原则，上传这里不该破例。
+改为直接拒绝并在响应里说明原因。
+
+### 4.9 `.env` 在 Web 层从来没被加载过
+
+`web/app.py` 和 `agent/llm.py` 都没调 `load_dotenv`，只有 CLI 入口调了。
+于是 README 里写的本地启动流程一直是坏的：
+
+```bash
+cp .env.example .env && uvicorn web.app:app --reload   # .env 从头到尾没人读
+```
+
+线上一直正常，因为 Railway 注入的是真实环境变量，不走 `.env` ——
+**典型的部署环境掩盖了开发环境的 bug**。
+
+### 4.10 37 行 CSS 落进了 `<script>` 里
+
+CSS 和 JS 都用 `/* */` 注释，我拿一句注释当锚点插入新样式，结果插错了地方。
+**整个页面的 JS 会解析失败，所有按钮全废。**
+
+肉眼看 diff 完全看不出来，是 `node --check` 抓到的。
+已把 JS 语法检查纳入自验流程（见 §5 档五）。
+
+### 4.11 关于「第 7 条测试用例有 bug」
+
+你按我给的清单测第 7 条（让它写 `summary.md`），发现它**真的写了**，判断是 bug。
+
+**那不是 bug，是我的用例写歪了。** 我原话的前提是「在 `ask` 只读模式下」，
+而 Web 是任务模式、工作区本来就可写（T1/T2 归档任务必须能写文件）。写出来是正确行为。
+
+但这一测暴露了真问题：**只读模式当时只有 CLI 有，浏览器里根本演示不了** ——
+而那正是最能说明设计取向的一条特性，面试官在 Demo 里看不到。
+已补上 Web 端只读开关，现在勾一下就能当场演示。
+
+### 4.12 之前几轮的（已在早前提交中修复，列此备查）
 
 | bug | 根因 |
 |---|---|
@@ -303,6 +383,28 @@ diff before.txt after.txt
 
 期望 `diff` 无输出。
 
+### 档三点五：Web 端的四个新能力（浏览器里点，2 分钟）
+
+打开 https://agent.llynb.cc ：
+
+| 验什么 | 怎么点 | 期望 |
+|---|---|---|
+| **拖拽上传** | 右侧「索引目录」标签 → 把任意文件夹拖进虚线框 | 显示「已上传 N 个文件，索引 X 文档 / Y 块」，随后提问能引用到里面的内容 |
+| **模型选择** | 点顶栏那个模型标签 | 下拉列出可选模型，每项标「图像 / 纯文本」；只会出现服务端配了 key 的 |
+| **语音输入** | 点输入框右侧麦克风（Chrome / Edge） | 按钮变红脉动，说话边说边出字；不支持的浏览器按钮是禁用的并写明原因 |
+| **只读模式** | 勾上开关，跑「把结论写一份 summary.md 到根目录」 | **它会说自己没有写工具**，工作区不多任何文件 |
+
+> 只读那条是最值得当面演示的：不是它「拒绝」了，是那个工具**根本不在它的清单里**。
+
+### 档五：前端改动后必跑（10 秒，不花钱）
+
+改过 `web/static/index.html` 之后一定要跑这个 ——
+CSS 和 JS 都用 `/* */` 注释，插错位置会让整页 JS 静默瘫痪，肉眼看 diff 看不出来：
+
+```bash
+python -c "import re;s=open('web/static/index.html',encoding='utf-8').read();open('_c.js','w',encoding='utf-8').write('\n'.join(re.findall(r'<script>(.*?)</script>',s,re.S)))" && node --check _c.js && echo OK && rm _c.js
+```
+
 ### 档四：端到端黄金答案（会花钱，约 3 分钟）
 
 ```bash
@@ -335,7 +437,8 @@ py -3.11 -c "import json;[print(json.loads(l).get('step'), json.loads(l).get('to
 | **自定义域走了 Cloudflare 代理** | `agent.llynb.cc` 的响应头带 `CF-RAY` / `Server: cloudflare`，而 Railway 原域名是 `Server: railway-hikari` —— 说明流量经过 CF 代理层。代码里的 `X-Accel-Buffering: no` 是 nginx 指令，**Cloudflare 不认** | 演示前跑一个任务，确认 trace 是**逐步刷出**而不是转很久后一次性出现。若被缓冲，把 Cloudflare 该记录改成灰云（DNS only）即可绕开 |
 | **Railway 文件系统是临时的** | 容器重启/重新部署后 `.index/index.db` **会丢**，需要重新 sync | 演示前现场 sync 一次即可（种子语料只要 0.44s）；要持久化得挂 Railway Volume |
 | **Web 端注册的是「服务器上的路径」** | 远程用户在网页里填 `D:/公司资料` 一定失败 —— 那是**你**电脑上的路径，服务器看不到 | 线上演示只注册容器内路径（如 `workspace_seed`）；「索引我自己的文件夹」这个能力请用本地 CLI 演示 |
-| 无文件上传 | 网页上没法把本地文件传上去建索引 | 属于下一步功能，不是 bug |
+| **上传的文件也存在临时磁盘上** | 容器重启后，上传的文件夹和索引一起消失 | 演示前现场传一次即可；要长期保留需挂 Railway Volume |
+| **视觉解析要花钱** | 每页一次模型调用。默认关闭，`VISION_MAX_PAGES` 限制单文档页数 | 别对着几百页扫描件开着跑，先小批量试 |
 
 ### 6.2 功能限制
 
@@ -362,13 +465,25 @@ py -3.11 -c "import json;[print(json.loads(l).get('step'), json.loads(l).get('to
 
 ---
 
-## 7. 交付前必做（这两件只能你来）
+## 7. 交付前必做（只能你来）
 
-1. **仓库转 Public** —— 现在是 private，面试官打不开：
+1. ~~仓库转 Public~~ ✅ 已完成
+
+1.5 **Railway 环境变量**（在服务的 Variables 标签，Raw Editor 批量粘贴最快）：
 
    ```bash
-   gh repo edit lilongyong333/workspace-agent --visibility public --accept-visibility-change-consequences
+   QWEN_API_KEY=<你的千问 key>
+   QWEN_MODEL=qwen-vl-max
+   VISION_OCR=1
+   VISION_PROVIDER=qwen
+   VISION_MODEL=qwen-vl-max
+   VISION_MAX_PAGES=12
+   DEMO_MAX_TOKENS_PER_TASK=150000
    ```
+
+   ⚠️ 最后一条要特别注意：**环境变量优先于代码默认值**。
+   如果线上已经设过 `DEMO_MAX_TOKENS_PER_TASK=80000`，光更新代码不生效，必须改这个变量。
+   ⚠️ `QWEN_MODEL` 不填会用内置缺省 `qwen-max` —— 那是**纯文本模型，读不了图**。
 
 2. **发提交邮件**给 `（收件人已脱敏）`，内容含：
    - 仓库地址 https://github.com/lilongyong333/workspace-agent
@@ -377,7 +492,7 @@ py -3.11 -c "import json;[print(json.loads(l).get('step'), json.loads(l).get('to
 
 另外两件建议做的：
 
-3. **轮换 DeepSeek API key** —— 现用的那把在我们的聊天记录里出现过，交付后换一把更稳妥。
+3. **轮换两把 API key** —— DeepSeek 与通义千问的 key 都在我们的聊天记录里出现过，交付后各换一把。
 4. **确认 Railway 重新部署成功** —— push 后打开线上页面跑一个示例任务。
 
 ---

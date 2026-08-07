@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import difflib
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,12 +137,61 @@ class Sandbox:
         return path.relative_to(self.root).as_posix()
 
     # ------------------------------------------------------------------
+    # 报错即引导
+    # ------------------------------------------------------------------
+    #
+    # 「不是文件或不存在」是个死胡同 —— 模型读到它，只能再猜一次。
+    #
+    # 真实案例：模型读完 meetings/（文件名形如 2026-01-07-team-retro.md）之后，
+    # 把这套日期前缀命名规范**跨目录套用**到 notes/，
+    # 连编三个 2025-08-29-project-falcon-overview.md 这样的文件名，
+    # 一个回合三次调用全废。而 notes/ 里真实存在的是
+    # falcon-migration-checklist.md —— 它其实是在拿碎片记忆硬拼。
+    #
+    # 与其在 system prompt 里写「请先 list_dir 再 read_file」（模型在上下文压力下会忘），
+    # 不如让报错本身带上纠正所需的全部信息：同级目录里到底有什么、哪几个最像。
+    # 这和「用接口形状引导模型」是同一条原则 —— 错误信息也是接口的一部分。
+    MAX_HINT_ENTRIES = 20
+
+    def _missing_path_error(self, rel_path: str, expect: str) -> SandboxError:
+        """构造带纠正线索的「不存在」错误。
+
+        安全性：这里列出的内容模型本来就能用 list_dir 拿到，不构成新的信息泄露。
+        """
+        head = f"{expect}不存在: {rel_path}"
+        try:
+            parent_rel = Path(str(rel_path).strip()).parent.as_posix()
+            parent = self.resolve(parent_rel)
+        except SandboxError:
+            return SandboxError(head)
+
+        if not parent.is_dir():
+            return SandboxError(
+                f"{head}。上层目录 {parent_rel!r} 也不存在 —— 请先 list_dir 确认目录结构。"
+            )
+
+        names = sorted(p.name + ("/" if p.is_dir() else "") for p in parent.iterdir())
+        if not names:
+            return SandboxError(f"{head}。目录 {parent_rel!r} 是空的。")
+
+        close = difflib.get_close_matches(Path(rel_path).name, names, n=3, cutoff=0.4)
+        shown = names[: self.MAX_HINT_ENTRIES]
+        more = f"（共 {len(names)} 项，只列前 {len(shown)} 项）" if len(names) > len(shown) else ""
+
+        msg = f"{head}。目录 {parent_rel!r} 实际包含{more}: {', '.join(shown)}"
+        if close:
+            msg += f"。最接近的是: {', '.join(close)}"
+        return SandboxError(msg)
+
+    # ------------------------------------------------------------------
     # 读
     # ------------------------------------------------------------------
     def list_dir(self, rel_path: str = ".", recursive: bool = False) -> list[FileEntry]:
         target = self.resolve(rel_path)
         if not target.is_dir():
-            raise SandboxError(f"不是目录: {rel_path}")
+            if not target.exists():
+                raise self._missing_path_error(rel_path, "目录")
+            raise SandboxError(f"不是目录（是个文件）: {rel_path}")
 
         paths = sorted(target.rglob("*") if recursive else target.iterdir())
         entries: list[FileEntry] = []
@@ -167,7 +217,9 @@ class Sandbox:
         """
         target = self.resolve(rel_path)
         if not target.is_file():
-            raise SandboxError(f"不是文件或不存在: {rel_path}")
+            if target.is_dir():
+                raise SandboxError(f"这是目录不是文件: {rel_path}（请用 list_dir）")
+            raise self._missing_path_error(rel_path, "文件")
 
         size = target.stat().st_size
         if size > self.max_read_bytes:
@@ -186,7 +238,9 @@ class Sandbox:
         """
         target = self.resolve(rel_path)
         if not target.is_file():
-            raise SandboxError(f"不是文件或不存在: {rel_path}")
+            if target.is_dir():
+                raise SandboxError(f"这是目录不是文件: {rel_path}（请用 list_dir）")
+            raise self._missing_path_error(rel_path, "文件")
         with target.open("r", encoding="utf-8", errors="replace", newline="") as fh:
             yield from enumerate(fh, start=1)
 

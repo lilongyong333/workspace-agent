@@ -15,7 +15,7 @@
 | 项目 | 状态 |
 |---|---|
 | 离线测试 | **112 / 112 通过**（约 9 秒） |
-| 端到端测试 | 5 项，需 `--live` 与真实 API key |
+| 端到端测试 | **5 / 5 通过**（真调模型，2分50秒）—— 索引子系统上线后的首次完整验证 |
 | 在线 Demo | **https://agent.llynb.cc** （自定义域已生效，证书有效；Railway 原域名仍可用作备份） |
 | GitHub 仓库 | https://github.com/lilongyong333/workspace-agent （已 Public ✅） |
 | 代码量 | agent 核心 2,351 行（含 index 子系统 1,855）+ web 683 + 测试 1,881 + 前端 50KB |

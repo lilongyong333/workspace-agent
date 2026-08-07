@@ -376,14 +376,33 @@ def _execute(run: Run) -> None:
 # API
 # ======================================================================
 @app.post("/api/session")
-async def create_session(reset: bool = Query(False), session_id: str | None = Query(None)) -> JSONResponse:
-    """新建或重置会话工作目录。"""
-    sid = session_id if (session_id and reset) else str(uuid.uuid4())
-    if session_id and reset:
+async def create_session(reset: bool = Query(False),
+                         session_id: str | None = Query(None)) -> JSONResponse:
+    """取回（或新建 / 重置）会话工作目录。
+
+    条件曾经写成 ``session_id if (session_id and reset) else uuid4()`` ——
+    **只有"重置"时才认前端传来的 id，正常打开页面一律新建**。
+    于是每刷新一次就换一个全新工作区，上传的文件与索引全都"不见了"，
+    而磁盘上其实好端端地躺在上一个会话目录里。
+
+    用户看到的现象是「重新进入界面后，之前的资料都消失了」，
+    很自然会怀疑持久化没生效 —— 但真正的原因是他压根没回到原来那个会话。
+    这类 bug 最费排查时间：症状指向 A（存储），根因在 B（会话路由）。
+
+    正确语义：
+      * 带着合法 id 且不重置 → **回到那个会话**（工作区已存在则原样保留）
+      * 带着合法 id 且重置   → 同一个 id，工作区从种子重建
+      * 没带 id             → 新建一个
+    """
+    sid = None
+    if session_id:
         try:
             uuid.UUID(session_id)
+            sid = session_id
         except ValueError:
-            sid = str(uuid.uuid4())
+            sid = None                      # 非法 id 一律当作没带
+    sid = sid or str(uuid.uuid4())
+
     ensure_session(sid, reset=reset)
     return JSONResponse({"session_id": sid, "reset": reset})
 

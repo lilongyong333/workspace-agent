@@ -295,3 +295,58 @@ def test_tool_capability_detection() -> None:
     # 视觉与工具是两件独立的事，不能互相推导
     assert model_supports_vision("qwen-vl-max")
     assert not model_supports_vision("qwen-max")
+
+
+# ----------------------------------------------------------------------
+# 会话粘性
+# ----------------------------------------------------------------------
+def test_reopening_returns_to_the_same_session(tmp_path: Path,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """带着已有 id 再进来，必须**回到同一个会话**，而不是新建。
+
+    这条曾经是反的：只有"重置"时才认前端传来的 id，正常打开页面一律新建 uuid。
+    于是每刷新一次就换一个全新工作区，上传的文件与索引全都"不见了" ——
+    而磁盘上其实好端端地躺在上一个会话目录里。
+
+    用户看到的现象是「重新进入界面，之前的资料都消失了」，
+    很自然会怀疑持久化没生效。症状指向存储，根因在会话路由 ——
+    这类错位最费排查时间。
+    """
+    c, store = _client(tmp_path, monkeypatch)
+
+    first = c.post("/api/session").json()["session_id"]
+    ws = A.SESSIONS_DIR / first
+    (ws / "我上传的.md").write_text("# 独一无二 tigermark3\n", encoding="utf-8")
+
+    again = c.post("/api/session", params={"session_id": first}).json()["session_id"]
+    assert again == first, "带着已有 id 再进来不该换会话"
+    assert (ws / "我上传的.md").is_file(), "工作区内容必须原样保留"
+    store.close()
+
+
+def test_reset_keeps_the_id_but_rebuilds_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """重置是"同一个会话、干净工作区"，不是"换一个会话"。"""
+    c, store = _client(tmp_path, monkeypatch)
+
+    sid = c.post("/api/session").json()["session_id"]
+    (A.SESSIONS_DIR / sid / "临时.md").write_text("x", encoding="utf-8")
+
+    same = c.post("/api/session", params={"session_id": sid, "reset": "true"}).json()
+    assert same["session_id"] == sid
+    assert not (A.SESSIONS_DIR / sid / "临时.md").exists(), "重置应清掉旧内容"
+    assert (A.SESSIONS_DIR / sid / "notes").is_dir(), "种子应被重新铺开"
+    store.close()
+
+
+def test_bogus_session_id_falls_back_to_a_new_one(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """非法 id 不能被直接拿去拼路径 —— 那是路径注入的入口。"""
+    c, store = _client(tmp_path, monkeypatch)
+    for bad in ("../../etc", "not-a-uuid", "a/b"):
+        got = c.post("/api/session", params={"session_id": bad}).json()["session_id"]
+        assert got != bad
+        import uuid as _u
+        _u.UUID(got)                       # 必须是合法 uuid
+    store.close()

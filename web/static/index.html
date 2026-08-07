@@ -412,25 +412,27 @@ textarea::placeholder{color:var(--text-3)}
           <input type="file" id="pick" webkitdirectory directory multiple hidden>
           <input type="file" id="pick-files" multiple hidden>
           <div class="drop-ic">📁</div>
-          <b>把文件夹拖到这里</b>
-          <span>或
+          <b>从你的电脑上传文件夹</b>
+          <span>拖到这里，或
             <button class="link" id="btn-pick">选择文件夹</button> ·
             <button class="link" id="btn-pick-files">选择文件</button>
           </span>
-          <span class="fine">上传后自动建索引，随即可提问。支持 pdf / docx / xlsx / pptx / csv / md / 代码</span>
+          <span class="fine">上传后自动建索引，随即可提问。<br>
+            支持 pdf / docx / xlsx / pptx / csv / md / 代码；扫描件与图片需开启视觉解析</span>
           <div class="up-bar" id="up-bar" hidden><i></i></div>
           <div class="up-log" id="up-log" hidden></div>
         </div>
 
         <div id="roots"></div>
         <div class="add-root">
-          <div class="ar-title">或指向服务器本地路径</div>
+          <div class="ar-title">或：指向服务器自己磁盘上的路径</div>
           <input id="root-path" placeholder="D:\我的资料  或  /home/me/docs">
           <input id="root-label" placeholder="标签（可选）">
           <button class="mini" id="btn-add-root">注册并索引这个文件夹</button>
           <div class="fine">
-            这里填的是<b>运行本服务那台机器</b>上的路径。线上部署时你本机的
-            D:\ 服务器看不到 —— 那种情况请用上面的上传。
+            ⚠️ 这里填的路径属于<b>运行本服务的那台机器</b>，不是你的电脑。<br>
+            · <b>用线上 Demo</b> → 填 <code>D:\…</code> 一定失败，请用上面的上传<br>
+            · <b>本地自己跑</b> → 填本机路径最方便，不用复制文件、也不占空间
           </div>
         </div>
       </div>
